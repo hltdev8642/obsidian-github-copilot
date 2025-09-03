@@ -9,6 +9,65 @@ import os from 'os';
 import path from 'path';
 import readline from 'readline';
 import { fileURLToPath } from 'url';
+import { exec as _exec, spawnSync } from 'child_process';
+import { promisify } from 'util';
+
+const exec = promisify(_exec);
+
+function detectShell() {
+  // Prefer PowerShell (pwsh/powershell) on Windows so PowerShell commands work.
+  if (process.platform === 'win32') {
+    const candidates = ['pwsh.exe', 'pwsh', 'powershell.exe', 'cmd.exe'];
+    for (const c of candidates) {
+      try {
+        const which = spawnSync('where', [c], { stdio: 'ignore' });
+        if (which.status === 0) return c;
+      } catch (e) {
+        // ignore
+      }
+    }
+    return 'cmd.exe';
+  }
+
+  // On Unix, prefer user's SHELL or /bin/bash
+  return process.env.SHELL || '/bin/bash';
+}
+
+function findExecutable(name) {
+  try {
+    if (process.platform === 'win32') {
+      const r = spawnSync('where', [name], { stdio: 'ignore' });
+      return r.status === 0;
+    } else {
+      const r = spawnSync('which', [name], { stdio: 'ignore' });
+      return r.status === 0;
+    }
+  } catch (e) {
+    return false;
+  }
+}
+
+async function runCommand(command) {
+  // On Windows, prefer wsl or bash if available for unix-style commands
+  if (process.platform === 'win32') {
+    if (findExecutable('wsl')) {
+      return exec(`wsl ${command}`, { shell: true, windowsHide: true });
+    }
+    if (findExecutable('bash')) {
+      // pass through bash -lc to interpret flags like -la
+      // escape single quotes by closing, inserting '\'' and reopening - simple approach
+      const safe = command.replace(/'/g, "'\\''");
+      return exec(`bash -lc '${safe}'`, { shell: true, windowsHide: true });
+    }
+    // fallback to detected shell (PowerShell/cmd)
+    const shell = detectShell();
+    return exec(command, { shell, windowsHide: true });
+  }
+
+  // On unix-like systems, use the user's shell
+  const shell = detectShell();
+  return exec(command, { shell, windowsHide: true });
+}
 
 const homedir = os.homedir();
 const PAT_FILE = path.join(homedir, '.copilot-pat');
@@ -73,7 +132,7 @@ async function fetchToken(pat) {
   return resp.json;
 }
 
-async function sendMessage(accessToken, message) {
+async function sendMessage(accessToken, messages) {
   const body = {
     intent: false,
     model: 'gpt-4o-2024-08-06',
@@ -81,7 +140,7 @@ async function sendMessage(accessToken, message) {
     top_p: 1,
     n: 1,
     stream: false,
-    messages: [{ role: 'user', content: message }]
+    messages: messages
   };
 
   const resp = await requestJson('https://api.githubcopilot.com/chat/completions', {
@@ -146,7 +205,7 @@ async function doAuth() {
   await poll();
 }
 
-async function doChat(message) {
+async function doChat(message, systemParts = []) {
   let pat = process.env.COPILOT_PAT || readPATFromFile();
   if (!pat) {
     console.error('No PAT found. Run `copilot-cli auth` first or set COPILOT_PAT env var.');
@@ -156,14 +215,82 @@ async function doChat(message) {
   const tokenResp = await fetchToken(pat);
   const accessToken = tokenResp.token;
   if (!accessToken) throw new Error('Failed to obtain access token from PAT');
+  // Build message list: optional system parts first, then user message
+  const messages = [];
+  for (const part of systemParts) messages.push({ role: 'system', content: part });
+  messages.push({ role: 'user', content: message });
 
-  const resp = await sendMessage(accessToken, message);
+  const resp = await sendMessage(accessToken, messages);
   if (resp.choices && resp.choices[0] && resp.choices[0].message) {
     console.log('\nAssistant:');
     console.log(resp.choices[0].message.content);
   } else {
     console.log('Unexpected response:', JSON.stringify(resp, null, 2));
   }
+}
+
+function parseInlineCommands(text) {
+  const reads = [];
+  const execs = [];
+  const writes = [];
+
+  // read patterns: read/show/cat "path" or read contents of path
+  const readRegex = /(?:\b(?:read|show|cat|print)\b)(?:\s+(?:the\s+)?)?(?:contents\s+of\s+)?\s*(?:"([^"]+)"|'([^']+)'|([^\s]+))/ig;
+  let m;
+  while ((m = readRegex.exec(text)) !== null) {
+    const p = m[1] || m[2] || m[3];
+    if (p) reads.push(p);
+  }
+
+  // exec patterns: exec/execute/run "cmd" or exec cmd
+  const execRegex = /(?:\b(?:exec|execute|run)\b)(?:\s+(?:the\s+)?)?(?:command\s+)?\s*(?:"([^"]+)"|'([^']+)'|([^\n]+))/ig;
+  while ((m = execRegex.exec(text)) !== null) {
+    const c = (m[1] || m[2] || m[3] || '').trim();
+    if (c) execs.push(c);
+  }
+
+  // write patterns: write "content" to path OR write content to path
+  const writeRegex = /(?:\b(?:write|save)\b)\s+(?:"([^"]+)"|'([^']+)'|(.+?))\s+(?:to|into|at)\s+(?:"([^"]+)"|'([^']+)'|([^\s]+))/ig;
+  while ((m = writeRegex.exec(text)) !== null) {
+    const content = (m[1] || m[2] || m[3] || '').trim();
+    const p = m[4] || m[5] || m[6];
+    if (p) writes.push({ path: p, content });
+  }
+
+  return { reads, execs, writes };
+}
+
+function isChatIntent(text) {
+  // detect if the user is asking the model to do something beyond running the command
+  return /\b(summarize|explain|analyze|describe|what|how|why|please|tell|rewrite|convert|refactor)\b/i.test(text);
+}
+
+function isCommandOnly(text) {
+  if (!text || text.trim().length === 0) return false;
+  // reuse the same inline regexes to strip commands
+  const readRegex = /(?:\b(?:read|show|cat|print)\b)(?:\s+(?:the\s+)?)?(?:contents\s+of\s+)?\s*(?:"([^"\\]+)"|'([^'\\]+)'|([^\s]+))/ig;
+  const execRegex = /(?:\b(?:exec|execute|run)\b)(?:\s+(?:the\s+)?)?(?:command\s+)?\s*(?:"([^"\\]+)"|'([^'\\]+)'|([^\n]+))/ig;
+  const writeRegex = /(?:\b(?:write|save)\b)\s+(?:"([^"\\]+)"|'([^'\\]+)'|(.+?))\s+(?:to|into|at)\s+(?:"([^"\\]+)"|'([^'\\]+)'|([^\s]+))/ig;
+
+  let cleaned = text.replace(readRegex, '');
+  cleaned = cleaned.replace(execRegex, '');
+  cleaned = cleaned.replace(writeRegex, '');
+
+  // remove common punctuation and whitespace
+  cleaned = cleaned.replace(/^["'\s:\-]+|["'\s:\-]+$/g, '');
+  return cleaned.trim().length === 0;
+}
+
+function normalizeCommand(cmd) {
+  if (!cmd) return cmd;
+  // Trim whitespace and surrounding quotes
+  let out = cmd.trim();
+  if ((out.startsWith('"') && out.endsWith('"')) || (out.startsWith("'") && out.endsWith("'"))) {
+    out = out.slice(1, -1);
+  }
+  // Remove stray leading/trailing backslashes produced by Windows quoting in some shells
+  out = out.replace(/^\\+|\\+$/g, '');
+  return out;
 }
 
 async function main() {
@@ -176,15 +303,177 @@ async function main() {
 
   const cmd = args[0];
   try {
+    // file I/O and exec commands
+    if (cmd === 'read') {
+      const target = args[1];
+      if (!target) {
+        console.error('Usage: copilot-cli read <path>');
+        process.exit(1);
+      }
+      try {
+        const content = fs.readFileSync(path.resolve(target), 'utf8');
+        console.log(content);
+      } catch (e) {
+        console.error('Failed to read file:', e.message);
+        process.exit(1);
+      }
+      process.exit(0);
+    }
+
+    if (cmd === 'write') {
+      const target = args[1];
+      const data = args.slice(2).join(' ');
+      if (!target || data === undefined) {
+        console.error('Usage: copilot-cli write <path> <content>');
+        process.exit(1);
+      }
+      try {
+        fs.writeFileSync(path.resolve(target), data, 'utf8');
+        console.log('Wrote', target);
+      } catch (e) {
+        console.error('Failed to write file:', e.message);
+        process.exit(1);
+      }
+      process.exit(0);
+    }
+
+    if (cmd === 'exec') {
+      const command = args.slice(1).join(' ');
+      if (!command) {
+        console.error('Usage: copilot-cli exec <command>');
+        process.exit(1);
+      }
+      try {
+        // Run in detected shell (PowerShell on Windows if available)
+        const shell = detectShell();
+        const { stdout, stderr } = await exec(command, { shell, windowsHide: true });
+        if (stdout) process.stdout.write(stdout);
+        if (stderr) process.stderr.write(stderr);
+      } catch (e) {
+        console.error('Command failed:', e.message);
+        process.exit(1);
+      }
+      process.exit(0);
+    }
     if (cmd === 'auth') {
       await doAuth();
     } else if (cmd === 'chat') {
-      const msg = args.slice(1).join(' ');
-      if (!msg) {
-        console.error('Please provide a message: copilot-cli chat "Hello"');
+      // Simple flag parsing for chat: --read <path>, --exec <command>, --write <path>
+      const flags = {};
+      const rest = [];
+      for (let i = 1; i < args.length; i++) {
+        const a = args[i];
+        if (a === '--read' || a === '-r') {
+          flags.read = args[++i];
+        } else if (a === '--exec' || a === '-x') {
+          flags.exec = args[++i];
+        } else if (a === '--write' || a === '-w') {
+          flags.write = args[++i];
+        } else {
+          rest.push(a);
+        }
+      }
+
+      const msg = rest.join(' ');
+      if (!msg && !flags.read && !flags.exec) {
+        console.error('Please provide a message or use --read/--exec: copilot-cli chat [flags] "message"');
         process.exit(1);
       }
-      await doChat(msg);
+
+      // prepare system context messages
+      const systemParts = [];
+
+      if (flags.read) {
+        try {
+          const content = fs.readFileSync(path.resolve(flags.read), 'utf8');
+          systemParts.push(`File contents of ${flags.read}:\n\n${content}`);
+        } catch (e) {
+          console.error('Failed to read file for --read:', e.message);
+          process.exit(1);
+        }
+      }
+
+      if (flags.exec) {
+        try {
+          const shell = detectShell();
+          const commandToRun = normalizeCommand(flags.exec);
+          const { stdout, stderr } = await runCommand(commandToRun);
+          const out = stdout ? stdout : '';
+          const err = stderr ? stderr : '';
+          systemParts.push(`Command output of (${flags.exec}):\n\n${out}${err}`);
+        } catch (e) {
+          console.error('Failed to execute command for --exec:', e.message);
+          process.exit(1);
+        }
+      }
+
+      // If --write provided, write the message to the file before sending
+      if (flags.write) {
+        try {
+          fs.writeFileSync(path.resolve(flags.write), msg, 'utf8');
+          console.log('Wrote message to', flags.write);
+        } catch (e) {
+          console.error('Failed to write file for --write:', e.message);
+          process.exit(1);
+        }
+      }
+
+      // Parse inline commands from the message as well
+      const inline = parseInlineCommands(msg);
+
+      // If there are inline reads/execs/writes, run them locally and decide behavior.
+      let inlineParts = [];
+
+      // run reads
+      for (const r of inline.reads) {
+        try {
+          const content = fs.readFileSync(path.resolve(r), 'utf8');
+          inlineParts.push(`File contents of ${r}:\n\n${content}`);
+        } catch (e) {
+          inlineParts.push(`Failed to read ${r}: ${e.message}`);
+        }
+      }
+
+      // run execs
+      for (const c of inline.execs) {
+        try {
+          const shell = detectShell();
+          const commandToRun = normalizeCommand(c);
+          const { stdout, stderr } = await runCommand(commandToRun);
+          inlineParts.push(`Command output of (${c}):\n\n${stdout || ''}${stderr || ''}`);
+        } catch (e) {
+          inlineParts.push(`Failed to exec ${c}: ${e.message}`);
+        }
+      }
+
+      // run writes
+      for (const w of inline.writes) {
+        try {
+          fs.writeFileSync(path.resolve(w.path), w.content, 'utf8');
+          inlineParts.push(`Wrote to ${w.path}`);
+        } catch (e) {
+          inlineParts.push(`Failed to write ${w.path}: ${e.message}`);
+        }
+      }
+
+      // If the message is purely a command (no other chat intent), or only contains inline commands, print the inline results and exit.
+      if ((isCommandOnly(msg) || (!msg || msg.trim().length === 0)) && inlineParts.length > 0) {
+        console.log(inlineParts.join('\n\n'));
+        process.exit(0);
+      }
+
+      // Merge flags system parts and inline parts
+      const mergedSystemParts = [...systemParts, ...inlineParts];
+
+      // If there are system parts and no explicit chat intent in the message, treat them as context and send to chat
+      if (mergedSystemParts.length > 0 && isChatIntent(msg)) {
+        await doChat(msg, mergedSystemParts);
+      } else if (mergedSystemParts.length > 0 && !isChatIntent(msg)) {
+        // If no chat intent words found, but there are inline parts, show them and still send to chat to be safe
+        await doChat(msg, mergedSystemParts);
+      } else {
+        await doChat(msg, systemParts);
+      }
     } else {
       console.error('Unknown command', cmd);
       process.exit(1);

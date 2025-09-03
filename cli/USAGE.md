@@ -25,3 +25,21 @@ Or use env var without saving PAT file:
 $env:COPILOT_PAT = 'ghp_...'
 copilot-cli chat "Hello"
 ```
+
+Read a file:
+
+```powershell
+copilot-cli read ./styles.css
+```
+
+Write a file:
+
+```powershell
+copilot-cli write ./tmp.txt "hello world"
+```
+
+Execute a shell command:
+
+```powershell
+copilot-cli exec "echo hello"
+```
