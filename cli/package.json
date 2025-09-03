@@ -1,0 +1,15 @@
+{
+  "name": "copilot-cli",
+  "version": "0.1.0",
+  "description": "Minimal GitHub Copilot CLI (device-code auth + chat) built from obsidian-github-copilot repo reference",
+  "type": "module",
+  "bin": {
+    "copilot-cli": "./bin/copilot-cli.js"
+  },
+  "author": "",
+  "license": "MIT",
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {}
+}
