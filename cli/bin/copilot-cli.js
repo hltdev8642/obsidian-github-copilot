@@ -293,31 +293,106 @@ function normalizeCommand(cmd) {
   return out;
 }
 
+function printGeneralHelp() {
+  console.log('copilot-cli: minimal GitHub Copilot CLI');
+  console.log('Usage: copilot-cli <command> [options]\n');
+  console.log('Commands:');
+  console.log('  auth                       Start device-code auth flow and save PAT');
+  console.log('  chat [flags] <message>     Send a chat message');
+  console.log('    --read <path>    Include file contents as system context');
+  console.log('    --exec <cmd>     Execute a command and include output as context');
+  console.log('    --write <path>   Write the message to a file before sending');
+  console.log('  read <path>                Print file contents');
+  console.log('  write <path> <content>     Write content to a file');
+  console.log('  exec <command>             Execute a shell command');
+  console.log('  agent <goal> [options]     Run autonomous agent to achieve a goal');
+  console.log('    --allow-exec                 Allow exec steps (default: true)');
+  console.log('    --allow-write                Allow write steps');
+  console.log('    --max-steps N                Maximum steps to run (default: 5)');
+  console.log('    --dry-run                    Do not execute any steps, only show plan');
+  console.log('    --simulate                   Skip exec/write but allow reads');
+  console.log('    --yes, -y                    Auto-confirm prompts');
+  console.log('    --log <file>                 Save agent history JSON to file');
+  console.log('    --no-confirm-exec            Disable confirmation for exec steps');
+  console.log('    --no-confirm-write           Disable confirmation for write steps');
+}
+
+function printCommandHelp(command) {
+  const c = (command || '').toLowerCase();
+  switch (c) {
+    case 'auth':
+      console.log('auth — Start device-code auth flow and save PAT');
+      console.log('Usage: copilot-cli auth');
+      console.log('Opens a device-code URL and saves the resulting PAT to ~/.copilot-pat');
+      break;
+    case 'chat':
+      console.log('chat — Send a chat message to Copilot');
+      console.log('Usage: copilot-cli chat [flags] "message"');
+      console.log('Flags:');
+      console.log('  --read <path>    Include file contents as system context');
+      console.log('  --exec <cmd>     Execute a command and include output as context');
+      console.log('  --write <path>   Write the message to a file before sending');
+      console.log('\nExamples:');
+      console.log('  copilot-cli chat "Summarize the repo"');
+      console.log('  copilot-cli chat --read ./README.md "Summarize this file"');
+      break;
+    case 'read':
+      console.log('read — Print file contents');
+      console.log('Usage: copilot-cli read <path>');
+      break;
+    case 'write':
+      console.log('write — Write content to a file');
+      console.log('Usage: copilot-cli write <path> <content>');
+      break;
+    case 'exec':
+      console.log('exec — Execute a shell command');
+      console.log('Usage: copilot-cli exec <command>');
+      console.log('Example: copilot-cli exec "ls -la"');
+      break;
+    case 'agent':
+      console.log('agent — Autonomous agent to perform a goal using read/exec/write steps');
+      console.log('Usage: copilot-cli agent <goal> [options]');
+      console.log('Options:');
+      console.log('  --allow-exec            Allow exec steps (default: true)');
+      console.log('  --allow-write           Allow write steps');
+      console.log('  --max-steps N           Maximum steps to run (default: 5)');
+      console.log('  --dry-run               Do not execute any steps, only show plan');
+      console.log('  --simulate              Skip exec/write but allow reads');
+      console.log('  --yes, -y               Auto-confirm prompts');
+      console.log('  --log <file>            Save agent history JSON to file');
+      console.log('  --no-confirm-exec       Disable confirmation for exec steps');
+      console.log('  --no-confirm-write      Disable confirmation for write steps');
+      console.log('\nExamples:');
+      console.log('  copilot-cli agent "Summarize README.md" --dry-run');
+      console.log('  copilot-cli agent "Inspect top-level files and summarize" --simulate --log ./agent-log.json');
+      break;
+    default:
+      console.log(`No detailed help available for '${command}'.`);
+      printGeneralHelp();
+  }
+}
+
 async function main() {
   const args = process.argv.slice(2);
   const helpFlags = new Set(['help', '--help', '-help', 'h', '--h', '-h']);
-  if (args.length === 0 || helpFlags.has(args[0])) {
-    console.log('copilot-cli: minimal GitHub Copilot CLI');
-    console.log('Usage: copilot-cli <command> [options]\n');
-    console.log('Commands:');
-    console.log('  auth                       Start device-code auth flow and save PAT');
-    console.log('  chat [flags] <message>     Send a chat message');
-    console.log('    --read <path>    Include file contents as system context');
-    console.log('    --exec <cmd>     Execute a command and include output as context');
-    console.log('    --write <path>   Write the message to a file before sending');
-    console.log('  read <path>                Print file contents');
-    console.log('  write <path> <content>     Write content to a file');
-    console.log('  exec <command>             Execute a shell command');
-    console.log('  agent <goal> [options]     Run autonomous agent to achieve a goal');
-    console.log('    --allow-exec                 Allow exec steps (default: true)');
-    console.log('    --allow-write                Allow write steps');
-    console.log('    --max-steps N                Maximum steps to run (default: 5)');
-    console.log('    --dry-run                    Do not execute any steps, only show plan');
-    console.log('    --simulate                   Skip exec/write but allow reads');
-    console.log('    --yes, -y                    Auto-confirm prompts');
-    console.log('    --log <file>                 Save agent history JSON to file');
-    console.log('    --no-confirm-exec            Disable confirmation for exec steps');
-    console.log('    --no-confirm-write           Disable confirmation for write steps');
+  if (args.length === 0) {
+    printGeneralHelp();
+    process.exit(0);
+  }
+
+  // help <command>
+  if (helpFlags.has(args[0])) {
+    if (args[1]) {
+      printCommandHelp(args[1]);
+    } else {
+      printGeneralHelp();
+    }
+    process.exit(0);
+  }
+
+  // per-command help: e.g. `agent --help` or `agent -h`
+  if (args.slice(1).some(a => helpFlags.has(a))) {
+    printCommandHelp(args[0]);
     process.exit(0);
   }
 
