@@ -295,9 +295,29 @@ function normalizeCommand(cmd) {
 
 async function main() {
   const args = process.argv.slice(2);
-  if (args.length === 0) {
+  const helpFlags = new Set(['help', '--help', '-help', 'h', '--h', '-h']);
+  if (args.length === 0 || helpFlags.has(args[0])) {
     console.log('copilot-cli: minimal GitHub Copilot CLI');
-    console.log('Commands: auth, chat <message>');
+    console.log('Usage: copilot-cli <command> [options]\n');
+    console.log('Commands:');
+    console.log('  auth                       Start device-code auth flow and save PAT');
+    console.log('  chat [flags] <message>     Send a chat message');
+    console.log('    --read <path>    Include file contents as system context');
+    console.log('    --exec <cmd>     Execute a command and include output as context');
+    console.log('    --write <path>   Write the message to a file before sending');
+    console.log('  read <path>                Print file contents');
+    console.log('  write <path> <content>     Write content to a file');
+    console.log('  exec <command>             Execute a shell command');
+    console.log('  agent <goal> [options]     Run autonomous agent to achieve a goal');
+    console.log('    --allow-exec                 Allow exec steps (default: true)');
+    console.log('    --allow-write                Allow write steps');
+    console.log('    --max-steps N                Maximum steps to run (default: 5)');
+    console.log('    --dry-run                    Do not execute any steps, only show plan');
+    console.log('    --simulate                   Skip exec/write but allow reads');
+    console.log('    --yes, -y                    Auto-confirm prompts');
+    console.log('    --log <file>                 Save agent history JSON to file');
+    console.log('    --no-confirm-exec            Disable confirmation for exec steps');
+    console.log('    --no-confirm-write           Disable confirmation for write steps');
     process.exit(0);
   }
 
@@ -473,6 +493,226 @@ async function main() {
         await doChat(msg, mergedSystemParts);
       } else {
         await doChat(msg, systemParts);
+      }
+    } else if (cmd === 'agent') {
+      // agent <goal> [--allow-exec] [--allow-write] [--max-steps N] [--dry-run] [--yes] [--whitelist a,b]
+  const flags = { allowExec: true, allowWrite: false, maxSteps: 5, dryRun: false, yes: false, whitelist: [], simulate: false, log: null, confirmExec: false, confirmWrite: true, confirmRead: false };
+      const rest = [];
+      for (let i = 1; i < args.length; i++) {
+        const a = args[i];
+        if (a === '--allow-exec') flags.allowExec = true;
+        else if (a === '--allow-write') flags.allowWrite = true;
+        else if (a === '--max-steps') flags.maxSteps = parseInt(args[++i] || '5', 10) || 5;
+        else if (a === '--dry-run') flags.dryRun = true;
+        else if (a === '--yes' || a === '-y') flags.yes = true;
+        else if (a === '--whitelist') flags.whitelist = (args[++i] || '').split(',').map(s => s.trim()).filter(Boolean);
+        else if (a === '--simulate') flags.simulate = true;
+        else if (a === '--log') flags.log = args[++i];
+        else if (a === '--confirm-exec') flags.confirmExec = true;
+        else if (a === '--no-confirm-exec') flags.confirmExec = false;
+        else if (a === '--confirm-write') flags.confirmWrite = true;
+        else if (a === '--no-confirm-write') flags.confirmWrite = false;
+        else if (a === '--confirm-read') flags.confirmRead = true;
+        else if (a === '--no-confirm-read') flags.confirmRead = false;
+        else rest.push(a);
+      }
+
+      const goal = rest.join(' ');
+      if (!goal) {
+        console.error('Usage: copilot-cli agent <goal> [--allow-exec] [--allow-write] [--max-steps N] [--dry-run] [--yes] [--whitelist a,b]');
+        process.exit(1);
+      }
+
+      // helper: validate step schema
+      function validateStep(step) {
+        if (!step || typeof step !== 'object') return 'Step is not an object';
+        if (!step.action || typeof step.action !== 'string') return 'Missing or invalid action';
+        const act = step.action.toLowerCase();
+        if (!['read', 'exec', 'write'].includes(act)) return `Invalid action: ${step.action}`;
+        if (!step.target || typeof step.target !== 'string') return 'Missing or invalid target';
+        if (act === 'write' && (typeof step.content !== 'string')) return 'Write action requires content string';
+        // whitelist check if provided
+        if (flags.whitelist.length > 0) {
+          const ok = flags.whitelist.some(w => step.target.includes(w) || (step.content && step.content.includes(w)));
+          if (!ok) return `Target not in whitelist: ${step.target}`;
+        }
+        return null;
+      }
+
+      // helper: ask confirmation
+      function askConfirm(question) {
+        if (flags.yes) return Promise.resolve(true);
+        return new Promise((resolve) => {
+          const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+          rl.question(`${question} (y/n) `, (answer) => {
+            rl.close();
+            resolve(/^y(es)?$/i.test(answer.trim()));
+          });
+        });
+      }
+
+      // initial plan prompt
+      const planRequest = `You are an autonomous assistant that generates a plan of actions for a runtime to perform.\nGiven the goal: ${goal}\nReturn ONLY a JSON array (no surrounding text) where each element is an object with exactly these fields:\n- action: one of \"read\", \"exec\", \"write\"\n- target: path (for read/write) or command (for exec)\n- content: (optional) for write actions\nExample: [{"action":"read","target":"./README.md"},{"action":"exec","target":"ls -la"},{"action":"write","target":"./out.txt","content":"result"}]\nOutput nothing else.`;
+
+      // get access token
+      let pat = process.env.COPILOT_PAT || readPATFromFile();
+      if (!pat) {
+        console.error('No PAT found. Run `copilot-cli auth` or set COPILOT_PAT.');
+        process.exit(1);
+      }
+      const tokenResp = await fetchToken(pat);
+      const accessToken = tokenResp.token;
+      if (!accessToken) throw new Error('Failed to obtain access token from PAT');
+
+      // request initial plan
+      let planResp = await sendMessage(accessToken, [
+        { role: 'system', content: planRequest },
+        { role: 'user', content: goal }
+      ]);
+      let planText = planResp?.choices?.[0]?.message?.content || '';
+
+      // parse plan
+      let plan;
+      try { plan = JSON.parse(planText); } catch (e) {
+        const m = planText.match(/\{[\s\S]*\}|\[[\s\S]*\]/);
+        if (m) {
+          try { plan = JSON.parse(m[0]); } catch (e2) { plan = null; }
+        }
+      }
+
+      // retry stricter if needed
+      if (!Array.isArray(plan)) {
+        const strict = `You must respond with ONLY a JSON array (no explanation). Each element: {"action":"read"|"exec"|"write","target":"...","content":"..." (optional)}. Example: [{"action":"read","target":"./README.md"}]`;
+        planResp = await sendMessage(accessToken, [
+          { role: 'system', content: strict },
+          { role: 'user', content: planText || goal }
+        ]);
+        planText = planResp?.choices?.[0]?.message?.content || '';
+        const m2 = planText.match(/\{[\s\S]*\}|\[[\s\S]*\]/);
+        if (m2) {
+          try { plan = JSON.parse(m2[0]); } catch (e3) { plan = null; }
+        }
+      }
+
+      if (!Array.isArray(plan)) {
+        console.error('Agent: could not parse plan JSON from model output.');
+        console.log('Model output:\n', planText);
+        process.exit(1);
+      }
+
+      // iterative execution: we treat plan as a queue and after each action we can ask the model for next step
+      let queue = [...plan];
+      let stepIndex = 0;
+      const history = [];
+
+  while (stepIndex < flags.maxSteps) {
+        // if queue empty, ask model for next step given history
+        if (queue.length === 0) {
+          const askNext = `Given the goal: ${goal} and the history: ${JSON.stringify(history)}, return the NEXT step as a single JSON object or an empty array if done. Object format: {"action":"read"|"exec"|"write","target":"...","content":"..." (optional)}`;
+          const nextResp = await sendMessage(accessToken, [ { role: 'system', content: askNext }, { role: 'user', content: goal } ]);
+          const nextText = nextResp?.choices?.[0]?.message?.content || '';
+          const m = nextText.match(/\{[\s\S]*\}|\[[\s\S]*\]/);
+          let next;
+          if (m) {
+            try { next = JSON.parse(m[0]); } catch (e) { next = null; }
+          }
+          if (!next || (Array.isArray(next) && next.length === 0)) break;
+          if (!Array.isArray(next)) queue.push(next);
+        }
+
+        const s = queue.shift();
+        stepIndex++;
+        console.log(`Step ${stepIndex}:`, s.action, s.target || '');
+
+        const validationError = validateStep(s);
+        if (validationError) {
+          console.error('Invalid step, skipping:', validationError);
+          history.push({ step: s, result: `invalid: ${validationError}` });
+          continue;
+        }
+
+        // dry-run: don't execute, just show
+        if (flags.dryRun) {
+          console.log('[dry-run] Would execute:', s.action, s.target || '', s.content || '');
+          history.push({ step: s, result: '[dry-run] skipped' });
+          continue;
+        }
+
+        // simulate: do not perform exec/write, but allow read
+        if (flags.simulate && (s.action === 'exec' || s.action === 'write')) {
+          console.log('[simulate] Would execute:', s.action, s.target || '', s.content || '');
+          history.push({ step: s, result: '[simulate] skipped' });
+          continue;
+        }
+
+        // confirm per-action
+        let needsConfirm = false;
+        if (s.action === 'exec') needsConfirm = !!flags.confirmExec;
+        else if (s.action === 'write') needsConfirm = !!flags.confirmWrite;
+        else if (s.action === 'read') needsConfirm = !!flags.confirmRead;
+
+        if (needsConfirm) {
+          const proceed = await askConfirm(`Execute step ${stepIndex}: ${s.action} ${s.target || ''}?`);
+          if (!proceed) {
+            console.log('User declined. Skipping step.');
+            history.push({ step: s, result: 'user declined' });
+            continue;
+          }
+        }
+
+        // execute
+        if (s.action === 'read') {
+          try {
+            const content = fs.readFileSync(path.resolve(s.target), 'utf8');
+            console.log('Read output:\n', content.substring(0, 2000));
+            history.push({ step: s, result: content });
+          } catch (e) {
+            console.error('Read failed:', e.message);
+            history.push({ step: s, result: `read error: ${e.message}` });
+          }
+        } else if (s.action === 'exec') {
+          if (!flags.allowExec) {
+            console.warn('Exec not allowed. Skipping:', s.target);
+            history.push({ step: s, result: 'exec not allowed' });
+            continue;
+          }
+          try {
+            const commandToRun = normalizeCommand(s.target);
+            const { stdout, stderr } = await runCommand(commandToRun);
+            console.log('Exec stdout:\n', stdout || '');
+            if (stderr) console.error('Exec stderr:\n', stderr);
+            history.push({ step: s, result: stdout || stderr || '' });
+          } catch (e) {
+            console.error('Exec failed:', e.message);
+            history.push({ step: s, result: `exec error: ${e.message}` });
+          }
+        } else if (s.action === 'write') {
+          if (!flags.allowWrite) {
+            console.warn('Write not allowed. Skipping:', s.target);
+            history.push({ step: s, result: 'write not allowed' });
+            continue;
+          }
+          try {
+            fs.writeFileSync(path.resolve(s.target), s.content || '', 'utf8');
+            console.log('Wrote to', s.target);
+            history.push({ step: s, result: 'written' });
+          } catch (e) {
+            console.error('Write failed:', e.message);
+            history.push({ step: s, result: `write error: ${e.message}` });
+          }
+        }
+
+        // after each step, we optionally ask the model for a next step; loop continues
+      }
+
+      // write log if requested
+      if (flags.log) {
+        try {
+          fs.writeFileSync(path.resolve(flags.log), JSON.stringify({ goal, flags, history }, null, 2), 'utf8');
+          console.log('Agent history written to', flags.log);
+        } catch (e) {
+          console.error('Failed to write agent log:', e.message);
+        }
       }
     } else {
       console.error('Unknown command', cmd);
