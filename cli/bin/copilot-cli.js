@@ -14,6 +14,17 @@ import { promisify } from 'util';
 
 const exec = promisify(_exec);
 
+// Suppress specific experimental Fetch API warning emitted by Node
+process.on('warning', (warning) => {
+  try {
+    if (warning && typeof warning === 'object' && /Fetch API/.test(warning.message)) return;
+  } catch (e) {
+    // ignore
+  }
+  // re-emit other warnings to default handler
+  console.warn(warning.name + ': ' + warning.message);
+});
+
 function detectShell() {
   // Prefer PowerShell (pwsh/powershell) on Windows so PowerShell commands work.
   if (process.platform === 'win32') {
@@ -61,6 +72,12 @@ async function runCommand(command) {
     }
     // fallback to detected shell (PowerShell/cmd)
     const shell = detectShell();
+    // if we're on cmd.exe, translate some common unix commands to cmd equivalents
+    if (shell && shell.toLowerCase().includes('cmd.exe')) {
+      const t = translateCommandForCmd(command);
+      return exec(t, { shell, windowsHide: true });
+    }
+    // no PowerShell translation; execute as-is for PowerShell or other shells
     return exec(command, { shell, windowsHide: true });
   }
 
@@ -68,6 +85,44 @@ async function runCommand(command) {
   const shell = detectShell();
   return exec(command, { shell, windowsHide: true });
 }
+
+function translateCommandForCmd(cmd) {
+  if (!cmd || typeof cmd !== 'string') return cmd;
+  const s = cmd.trim();
+  const m = s.match(/^(\S+)(?:\s+([\s\S]*))?$/);
+  if (!m) return cmd;
+  const cmd0 = m[1];
+  const rest = (m[2] || '').trim();
+  // split rest into parts but keep quoted strings intact roughly
+  const parts = rest.length ? rest.match(/(?:"[^"]+"|'[^']+'|[^\s]+)/g) || [] : [];
+  // filter out unix-style flags like -la -l -a
+  const nonFlags = parts.filter(p => !p.startsWith('-'));
+
+  switch (cmd0) {
+    case 'ls':
+    case 'll':
+      // map to dir; keep path args
+      return 'dir ' + (nonFlags.join(' ') || '');
+    case 'cat':
+      return 'type ' + (nonFlags.join(' ') || '');
+    case 'rm':
+      // if recursive flag present, use rmdir /s /q
+      if (rest.includes('-r') || rest.includes('-R') || rest.includes('-rf')) {
+        return 'rmdir /s /q ' + (nonFlags.join(' ') || '');
+      }
+      return 'del ' + (nonFlags.join(' ') || '');
+    case 'mv':
+      return 'move ' + (parts.join(' '));
+    case 'cp':
+      return 'copy ' + (parts.join(' '));
+    case 'pwd':
+      return 'cd';
+    default:
+      return cmd; // unknown, leave as-is
+  }
+}
+
+// ...existing code...
 
 const homedir = os.homedir();
 const PAT_FILE = path.join(homedir, '.copilot-pat');
