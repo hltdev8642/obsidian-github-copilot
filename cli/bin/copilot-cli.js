@@ -62,7 +62,31 @@ async function runCommand(command) {
   // On Windows, prefer wsl or bash if available for unix-style commands
   if (process.platform === 'win32') {
     if (findExecutable('wsl')) {
-      return exec(`wsl ${command}`, { shell: true, windowsHide: true });
+      // Normalize Windows-style paths to WSL-friendly POSIX paths when possible.
+      // Replace backslashes with forward slashes and convert C:\... to /mnt/c/...
+      const convertPathForWsl = (s) => {
+        if (!s || typeof s !== 'string') return s;
+        // quick check for Windows drive letter like C:\ or C:/
+        const driveMatch = s.match(/^([A-Za-z]):[\\/](.*)$/);
+        if (driveMatch) {
+          const drive = driveMatch[1].toLowerCase();
+          const rest = driveMatch[2].replace(/\\/g, '/');
+          return `/mnt/${drive}/${rest}`;
+        }
+        // otherwise replace backslashes with slashes
+        return s.replace(/\\/g, '/');
+      };
+
+      // Attempt to convert any obvious Windows paths in the command string.
+      // This is conservative: only convert path-like segments containing backslashes or a drive letter.
+      const cmdSafe = command.replace(/([A-Za-z]:\\[^\s"']*[\\A-Za-z0-9_.-]*)/g, (m) => convertPathForWsl(m));
+      // Also convert plain backslash-containing segments
+      const cmdSafe2 = cmdSafe.replace(/[^\s"']*\\[^\s"']*/g, (m) => convertPathForWsl(m));
+      // Quote the whole command to avoid shell parsing surprises
+  const q = cmdSafe2.replace(/'/g, "'\\''");
+  // Run via bash with --noprofile --norc so user shell init files are not sourced
+  // This avoids errors from user .bashrc/.profile (e.g., sdkman) and provides common POSIX tools
+  return exec(`wsl bash --noprofile --norc -c '${q}'`, { shell: true, windowsHide: true });
     }
     if (findExecutable('bash')) {
       // pass through bash -lc to interpret flags like -la
@@ -120,6 +144,60 @@ function translateCommandForCmd(cmd) {
     default:
       return cmd; // unknown, leave as-is
   }
+}
+
+function isPathInside(parent, child) {
+  const relative = path.relative(parent, child);
+  return !!relative && !relative.startsWith('..') && !path.isAbsolute(relative);
+}
+
+function readDirRecursive(base, opts = {}) {
+  const maxDepth = typeof opts.maxDepth === 'number' ? opts.maxDepth : Infinity; // unlimited by default
+  const maxFileMB = (typeof opts.maxFileMB === 'number') ? opts.maxFileMB : null; // null = unlimited
+  const results = [];
+
+  function visit(dir, depth) {
+    if (depth > maxDepth) return;
+    let entries = [];
+    try {
+      entries = fs.readdirSync(dir, { withFileTypes: true });
+    } catch (e) {
+      return;
+    }
+    for (const ent of entries) {
+      const full = path.join(dir, ent.name);
+      if (ent.isDirectory()) {
+        visit(full, depth + 1);
+      } else if (ent.isFile()) {
+        try {
+          const stat = fs.statSync(full);
+          const sizeKB = Math.round(stat.size / 1024);
+          const sizeMB = +(sizeKB / 1024).toFixed(2);
+          if (maxFileMB !== null && sizeMB > maxFileMB) {
+            results.push({ path: full, snippet: `<file too large: ${sizeMB}MB>` });
+          } else {
+            const txt = fs.readFileSync(full, 'utf8');
+            results.push({ path: full, snippet: txt.slice(0, 2048) });
+          }
+        } catch (e) {
+          results.push({ path: full, snippet: `<read error: ${e.message}>` });
+        }
+      }
+    }
+  }
+
+  visit(base, 0);
+  return results;
+}
+
+function safeWriteRecursive(baseWorkspace, targetPath, content) {
+  const absBase = path.resolve(baseWorkspace || '.');
+  const absTarget = path.resolve(targetPath);
+  if (!isPathInside(absBase, absTarget)) throw new Error('Target path is outside of workspace');
+  // ensure directory exists
+  const dir = path.dirname(absTarget);
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(absTarget, content, 'utf8');
 }
 
 // ...existing code...
@@ -261,6 +339,27 @@ async function doAuth() {
 }
 
 async function doChat(message, systemParts = []) {
+  // chat-level workspace flags may be supplied via global args parsing earlier; we support
+  // passing workspace as an environment variable or via process.argv in the form --workspace <path>
+  // For backwards compatibility, we read from process.env.COPILOT_WORKSPACE if provided.
+  const workspaceFromEnv = process.env.COPILOT_WORKSPACE || null;
+  // helper to detect workspace flags from process.argv
+  function extractWorkspaceFlags() {
+    const a = process.argv.slice(2);
+    const out = { workspace: workspaceFromEnv, depth: Infinity, maxFileMB: null };
+    for (let i = 0; i < a.length; i++) {
+      if (a[i] === '--workspace') out.workspace = a[++i];
+      else if (a[i] === '--workspace-depth') {
+        const v = a[++i];
+        out.depth = v ? (parseInt(v, 10) || Infinity) : Infinity;
+      } else if (a[i] === '--workspace-max-file') {
+        const v = a[++i];
+        out.maxFileMB = v ? (parseFloat(v) || null) : null;
+      }
+    }
+    return out;
+  }
+  const wsFlags = extractWorkspaceFlags();
   let pat = process.env.COPILOT_PAT || readPATFromFile();
   if (!pat) {
     console.error('No PAT found. Run `copilot-cli auth` first or set COPILOT_PAT env var.');
@@ -357,6 +456,9 @@ function printGeneralHelp() {
   console.log('    --read <path>    Include file contents as system context');
   console.log('    --exec <cmd>     Execute a command and include output as context');
   console.log('    --write <path>   Write the message to a file before sending');
+  console.log('    --workspace <dir>            Include a workspace snapshot (recursive) as system context');
+  console.log('    --workspace-depth <N>        Max recursion depth for workspace snapshot (default: unlimited)');
+  console.log('    --workspace-max-file <M>     Max file size (MB) to include content in snapshot (default: unlimited)');
   console.log('  read <path>                Print file contents');
   console.log('  write <path> <content>     Write content to a file');
   console.log('  exec <command>             Execute a shell command');
@@ -539,6 +641,18 @@ async function main() {
           systemParts.push(`File contents of ${flags.read}:\n\n${content}`);
         } catch (e) {
           console.error('Failed to read file for --read:', e.message);
+          process.exit(1);
+        }
+      }
+
+      // if --workspace provided, include a recursive listing or file contents up to limits
+      if (wsFlags.workspace) {
+        try {
+          const wsPath = path.resolve(wsFlags.workspace);
+          const files = readDirRecursive(wsPath, { maxDepth: wsFlags.depth, maxFileMB: wsFlags.maxFileMB });
+          systemParts.push(`Workspace ${wsPath} snapshot (maxDepth=${wsFlags.depth === Infinity ? 'unlimited' : wsFlags.depth}, maxFileMB=${wsFlags.maxFileMB === null ? 'unlimited' : wsFlags.maxFileMB}MB):\n\n${files.map(f=>`${f.path}:\n${f.snippet}\n`).join('\n')}`);
+        } catch (e) {
+          console.error('Failed to read workspace for --workspace:', e.message);
           process.exit(1);
         }
       }
@@ -734,6 +848,23 @@ async function main() {
       let queue = [...plan];
       let stepIndex = 0;
       const history = [];
+      // workspace flags for agent
+      function extractWorkspaceFlagsAgent() {
+        const a = process.argv.slice(2);
+        const out = { workspace: process.env.COPILOT_WORKSPACE || null, depth: Infinity, maxFileMB: null };
+        for (let i = 0; i < a.length; i++) {
+          if (a[i] === '--workspace') out.workspace = a[++i];
+          else if (a[i] === '--workspace-depth') {
+            const v = a[++i];
+            out.depth = v ? (parseInt(v, 10) || Infinity) : Infinity;
+          } else if (a[i] === '--workspace-max-file') {
+            const v = a[++i];
+            out.maxFileMB = v ? (parseFloat(v) || null) : null;
+          }
+        }
+        return out;
+      }
+      const wsFlagsAgent = extractWorkspaceFlagsAgent();
 
   while (stepIndex < flags.maxSteps) {
         // if queue empty, ask model for next step given history
@@ -793,7 +924,11 @@ async function main() {
         // execute
         if (s.action === 'read') {
           try {
-            const content = fs.readFileSync(path.resolve(s.target), 'utf8');
+            const full = path.resolve(s.target);
+            if (wsFlagsAgent.workspace && !isPathInside(path.resolve(wsFlagsAgent.workspace), full)) {
+              throw new Error('Read target outside of workspace');
+            }
+            const content = fs.readFileSync(full, 'utf8');
             console.log('Read output:\n', content.substring(0, 2000));
             history.push({ step: s, result: content });
           } catch (e) {
@@ -823,7 +958,11 @@ async function main() {
             continue;
           }
           try {
-            fs.writeFileSync(path.resolve(s.target), s.content || '', 'utf8');
+            if (wsFlagsAgent.workspace) {
+              safeWriteRecursive(wsFlagsAgent.workspace, s.target, s.content || '');
+            } else {
+              fs.writeFileSync(path.resolve(s.target), s.content || '', 'utf8');
+            }
             console.log('Wrote to', s.target);
             history.push({ step: s, result: 'written' });
           } catch (e) {

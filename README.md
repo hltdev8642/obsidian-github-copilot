@@ -84,3 +84,24 @@ https://github.com/user-attachments/assets/89089920-45de-47c3-80b1-f2d58d1ba55e
 - [x] Let the user choose the default behavior of the enter key (send message or add a new line)
 - [ ] Stream the response from the API
   - Waiting for requestUrl to implement Streaming : https://forum.obsidian.md/t/support-streaming-the-request-and-requesturl-response-body/87381
+
+## CLI: Workspace flags and safety
+
+The repository includes a minimal CLI at `cli/bin/copilot-cli.js` which can be used to interact with GitHub Copilot from your terminal. The CLI supports a `--workspace` option which allows the CLI (and the autonomous `agent` mode) to include a snapshot of a directory as system context and to safely restrict read/write operations to that directory.
+
+Important behavior and defaults:
+
+- `--workspace <dir>`: when provided, the CLI will recursively read files under `<dir>` and include them in the chat system context so the model can reason about your workspace.
+- `--workspace-depth N` (default: unlimited): maximum recursion depth when collecting the workspace snapshot.
+- `--workspace-max-file M` (default: unlimited): maximum file size (in MB) to include the file contents. Larger files are represented as `<file too large: XMB>` in the snapshot.
+- Writes performed by `agent` mode will be constrained to the workspace path if `--workspace` is used; attempts to write outside the workspace will be rejected and logged.
+- Reads performed by `agent` mode will be rejected if outside the workspace when `--workspace` is set.
+- Safety flags: use `--dry-run` to preview planned steps without executing them, or `--simulate` to allow reads but skip destructive operations.
+
+Example usage (sandboxed):
+
+```bash
+node cli/bin/copilot-cli.js agent "List files and append a summary to summary.txt" --workspace ./cli/test-workspace --workspace-depth 2 --workspace-max-file-kb 50 --dry-run --log ./cli/agent-log.json
+```
+
+Note: Always test agent runs in a sandboxed workspace before running on sensitive data. The workspace flags are intended to reduce accidental access, but are not a substitute for careful review of agent plans.
