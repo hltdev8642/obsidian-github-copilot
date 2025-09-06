@@ -87,21 +87,54 @@ https://github.com/user-attachments/assets/89089920-45de-47c3-80b1-f2d58d1ba55e
 
 ## CLI: Workspace flags and safety
 
-The repository includes a minimal CLI at `cli/bin/copilot-cli.js` which can be used to interact with GitHub Copilot from your terminal. The CLI supports a `--workspace` option which allows the CLI (and the autonomous `agent` mode) to include a snapshot of a directory as system context and to safely restrict read/write operations to that directory.
+The repository includes a minimal CLI at `cli/bin/copilot-cli.js` which can be used to interact with GitHub Copilot from your terminal. The CLI supports both autonomous and interactive agent modes with workspace read/write/exec capabilities, optional web search tools, and comprehensive safety features.
 
-Important behavior and defaults:
+### Agent Modes
+
+**Autonomous Mode**: AI generates and executes a plan automatically
+**Interactive Mode**: User is prompted at each step for confirmation and input
+
+### Important behavior and defaults:
 
 - `--workspace <dir>`: when provided, the CLI will recursively read files under `<dir>` and include them in the chat system context so the model can reason about your workspace.
 - `--workspace-depth N` (default: unlimited): maximum recursion depth when collecting the workspace snapshot.
 - `--workspace-max-file M` (default: unlimited): maximum file size (in MB) to include the file contents. Larger files are represented as `<file too large: XMB>` in the snapshot.
 - Writes performed by `agent` mode will be constrained to the workspace path if `--workspace` is used; attempts to write outside the workspace will be rejected and logged.
 - Reads performed by `agent` mode will be rejected if outside the workspace when `--workspace` is set.
-- Safety flags: use `--dry-run` to preview planned steps without executing them, or `--simulate` to allow reads but skip destructive operations.
+- Safety flags: use `--dry-run` to preview planned steps without executing them, or `--simulate` to allow reads and searches but skip destructive operations.
 
-Example usage (sandboxed):
+### Interactive Agent Mode
 
+The `--interactive` (or `-i`) flag enables interactive mode where the user has control at each step:
+
+- **Step Review**: Review AI-suggested plans before execution
+- **Manual Steps**: Specify custom actions using `action:target[:content]` format
+- **Step-by-step Control**: Choose between AI suggestions, manual input, or exit at each step
+- **Web Search**: Use `--web-search` to enable research capabilities through web search
+
+### Web Search Tools
+
+When `--web-search` is enabled, the agent can perform web searches using the `search` action:
+- Uses DuckDuckGo API for research without requiring API keys
+- Returns summaries, direct answers, and related topics
+- Useful for gathering current information and best practices
+
+Example usage:
+
+**Autonomous mode (sandboxed):**
 ```bash
 node cli/bin/copilot-cli.js agent "List files and append a summary to summary.txt" --workspace ./cli/test-workspace --workspace-depth 2 --workspace-max-file-kb 50 --dry-run --log ./cli/agent-log.json
 ```
 
-Note: Always test agent runs in a sandboxed workspace before running on sensitive data. The workspace flags are intended to reduce accidental access, but are not a substitute for careful review of agent plans.
+**Interactive mode with web search:**
+```bash
+node cli/bin/copilot-cli.js agent "Research Node.js best practices and create a summary" --interactive --web-search --workspace ./docs --allow-write --log ./agent.json
+```
+
+**Manual step examples in interactive mode:**
+- `read:./package.json` - Read a file
+- `exec:npm test` - Execute a command
+- `write:./summary.md:# Project Summary` - Write content to file
+- `search:nodejs performance tips` - Search the web (when --web-search enabled)
+
+Note: Always test agent runs in a sandboxed workspace before running on sensitive data. The workspace flags are intended to reduce accidental access, but are not a substitute for careful review of agent plans. Interactive mode provides additional safety through user confirmation at each step.

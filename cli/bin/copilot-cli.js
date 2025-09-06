@@ -467,9 +467,11 @@ function printGeneralHelp() {
   console.log('    --allow-write                Allow write steps');
   console.log('    --max-steps N                Maximum steps to run (default: 5)');
   console.log('    --dry-run                    Do not execute any steps, only show plan');
-  console.log('    --simulate                   Skip exec/write but allow reads');
+  console.log('    --simulate                   Skip exec/write but allow reads and search');
   console.log('    --yes, -y                    Auto-confirm prompts');
   console.log('    --log <file>                 Save agent history JSON to file');
+  console.log('    --interactive, -i            Interactive mode: ask user for each step');
+  console.log('    --web-search                 Enable web search capabilities');
   console.log('    --no-confirm-exec            Disable confirmation for exec steps');
   console.log('    --no-confirm-write           Disable confirmation for write steps');
 }
@@ -740,7 +742,7 @@ async function main() {
       }
     } else if (cmd === 'agent') {
       // agent <goal> [--allow-exec] [--allow-write] [--max-steps N] [--dry-run] [--yes] [--whitelist a,b]
-  const flags = { allowExec: true, allowWrite: false, maxSteps: 5, dryRun: false, yes: false, whitelist: [], simulate: false, log: null, confirmExec: false, confirmWrite: true, confirmRead: false };
+  const flags = { allowExec: true, allowWrite: false, maxSteps: 5, dryRun: false, yes: false, whitelist: [], simulate: false, log: null, confirmExec: false, confirmWrite: true, confirmRead: false, interactive: false, webSearch: false };
       const rest = [];
       for (let i = 1; i < args.length; i++) {
         const a = args[i];
@@ -758,12 +760,15 @@ async function main() {
         else if (a === '--no-confirm-write') flags.confirmWrite = false;
         else if (a === '--confirm-read') flags.confirmRead = true;
         else if (a === '--no-confirm-read') flags.confirmRead = false;
+        else if (a === '--interactive' || a === '-i') flags.interactive = true;
+        else if (a === '--web-search') flags.webSearch = true;
         else rest.push(a);
       }
 
       const goal = rest.join(' ');
       if (!goal) {
-        console.error('Usage: copilot-cli agent <goal> [--allow-exec] [--allow-write] [--max-steps N] [--dry-run] [--yes] [--whitelist a,b]');
+        console.error('Usage: copilot-cli agent <goal> [options]');
+        console.error('Options: --allow-exec --allow-write --max-steps N --dry-run --simulate --interactive --web-search --workspace dir --yes --log file');
         process.exit(1);
       }
 
@@ -772,7 +777,8 @@ async function main() {
         if (!step || typeof step !== 'object') return 'Step is not an object';
         if (!step.action || typeof step.action !== 'string') return 'Missing or invalid action';
         const act = step.action.toLowerCase();
-        if (!['read', 'exec', 'write'].includes(act)) return `Invalid action: ${step.action}`;
+        const validActions = flags.webSearch ? ['read', 'exec', 'write', 'search'] : ['read', 'exec', 'write'];
+        if (!validActions.includes(act)) return `Invalid action: ${step.action}`;
         if (!step.target || typeof step.target !== 'string') return 'Missing or invalid target';
         if (act === 'write' && (typeof step.content !== 'string')) return 'Write action requires content string';
         // whitelist check if provided
@@ -781,6 +787,47 @@ async function main() {
           if (!ok) return `Target not in whitelist: ${step.target}`;
         }
         return null;
+      }
+
+      // helper: perform web search
+      async function performWebSearch(query) {
+        if (!flags.webSearch) {
+          throw new Error('Web search not enabled. Use --web-search flag to enable.');
+        }
+        
+        try {
+          // Use DuckDuckGo Instant Answer API (no API key required)
+          const searchUrl = `https://api.duckduckgo.com/?q=${encodeURIComponent(query)}&format=json&no_html=1&skip_disambig=1`;
+          const response = await fetch(searchUrl);
+          const data = await response.json();
+          
+          let result = `Web search for: "${query}"\n\n`;
+          
+          if (data.AbstractText) {
+            result += `Summary: ${data.AbstractText}\n`;
+          }
+          
+          if (data.Answer) {
+            result += `Answer: ${data.Answer}\n`;
+          }
+          
+          if (data.RelatedTopics && data.RelatedTopics.length > 0) {
+            result += `\nRelated topics:\n`;
+            data.RelatedTopics.slice(0, 3).forEach((topic, i) => {
+              if (topic.Text) {
+                result += `${i + 1}. ${topic.Text}\n`;
+              }
+            });
+          }
+          
+          if (!data.AbstractText && !data.Answer && (!data.RelatedTopics || data.RelatedTopics.length === 0)) {
+            result += `No direct results found. You may want to try a more specific query.`;
+          }
+          
+          return result;
+        } catch (error) {
+          return `Web search failed: ${error.message}`;
+        }
       }
 
       // helper: ask confirmation
@@ -795,8 +842,70 @@ async function main() {
         });
       }
 
+      // helper: interactive step planning (for interactive mode)
+      async function askForNextStep(currentGoal, history) {
+        if (!flags.interactive) return null;
+        
+        return new Promise((resolve) => {
+          const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+          
+          console.log('\n=== Interactive Agent Mode ===');
+          console.log(`Goal: ${currentGoal}`);
+          if (history.length > 0) {
+            console.log(`\nPrevious steps completed: ${history.length}`);
+            console.log('Recent steps:');
+            history.slice(-3).forEach((h, i) => {
+              console.log(`  ${history.length - 3 + i + 1}. ${h.step.action} ${h.step.target} -> ${h.result}`);
+            });
+          }
+          
+          console.log('\nWhat would you like to do next?');
+          console.log('Options:');
+          console.log('  1. Let AI suggest next step');
+          console.log('  2. Specify custom action manually');
+          console.log('  3. Finish/exit');
+          
+          rl.question('Choose option (1/2/3): ', (choice) => {
+            if (choice === '3') {
+              rl.close();
+              resolve('exit');
+            } else if (choice === '2') {
+              console.log('\nManual action format: action:target[:content]');
+              console.log('Examples:');
+              console.log('  read:./file.txt');
+              console.log('  exec:ls -la');
+              console.log('  write:./output.txt:Hello World');
+              if (flags.webSearch) {
+                console.log('  search:how to use nodejs');
+              }
+              
+              rl.question('Enter action: ', (actionInput) => {
+                rl.close();
+                const parts = actionInput.split(':');
+                if (parts.length < 2) {
+                  console.log('Invalid format. Skipping step.');
+                  resolve(null);
+                } else {
+                  const step = {
+                    action: parts[0],
+                    target: parts[1],
+                    content: parts[2] || undefined
+                  };
+                  resolve(step);
+                }
+              });
+            } else {
+              rl.close();
+              resolve('ai');
+            }
+          });
+        });
+      }
+
       // initial plan prompt
-      const planRequest = `You are an autonomous assistant that generates a plan of actions for a runtime to perform.\nGiven the goal: ${goal}\nReturn ONLY a JSON array (no surrounding text) where each element is an object with exactly these fields:\n- action: one of \"read\", \"exec\", \"write\"\n- target: path (for read/write) or command (for exec)\n- content: (optional) for write actions\nExample: [{"action":"read","target":"./README.md"},{"action":"exec","target":"ls -la"},{"action":"write","target":"./out.txt","content":"result"}]\nOutput nothing else.`;
+      const availableActions = flags.webSearch ? '"read", "exec", "write", "search"' : '"read", "exec", "write"';
+      const searchExample = flags.webSearch ? ',{"action":"search","target":"latest nodejs features"}' : '';
+      const planRequest = `You are an autonomous assistant that generates a plan of actions for a runtime to perform.\nGiven the goal: ${goal}\nReturn ONLY a JSON array (no surrounding text) where each element is an object with exactly these fields:\n- action: one of ${availableActions}\n- target: path (for read/write), command (for exec), or search query (for search)\n- content: (optional) for write actions\nExample: [{"action":"read","target":"./README.md"},{"action":"exec","target":"ls -la"},{"action":"write","target":"./out.txt","content":"result"}${searchExample}]\nOutput nothing else.`;
 
       // get access token
       let pat = process.env.COPILOT_PAT || readPATFromFile();
@@ -845,9 +954,24 @@ async function main() {
       }
 
       // iterative execution: we treat plan as a queue and after each action we can ask the model for next step
-      let queue = [...plan];
+      let queue = flags.interactive ? [] : [...plan]; // In interactive mode, start with empty queue
       let stepIndex = 0;
       const history = [];
+      
+      // In interactive mode, show initial plan for review
+      if (flags.interactive && plan.length > 0) {
+        console.log('\n=== Interactive Agent Mode ===');
+        console.log(`Goal: ${goal}`);
+        console.log('\nAI suggested initial plan:');
+        plan.forEach((step, i) => {
+          console.log(`  ${i + 1}. ${step.action} ${step.target}${step.content ? ` (content: ${step.content.substring(0, 50)}...)` : ''}`);
+        });
+        
+        const usePlan = await askConfirm('\nWould you like to use this plan?');
+        if (usePlan) {
+          queue = [...plan];
+        }
+      }
       // workspace flags for agent
       function extractWorkspaceFlagsAgent() {
         const a = process.argv.slice(2);
@@ -867,9 +991,42 @@ async function main() {
       const wsFlagsAgent = extractWorkspaceFlagsAgent();
 
   while (stepIndex < flags.maxSteps) {
-        // if queue empty, ask model for next step given history
-        if (queue.length === 0) {
-          const askNext = `Given the goal: ${goal} and the history: ${JSON.stringify(history)}, return the NEXT step as a single JSON object or an empty array if done. Object format: {"action":"read"|"exec"|"write","target":"...","content":"..." (optional)}`;
+        // Interactive mode: ask user for next step if queue is empty
+        if (queue.length === 0 && flags.interactive) {
+          const nextStepChoice = await askForNextStep(goal, history);
+          
+          if (nextStepChoice === 'exit') {
+            console.log('User requested exit. Stopping agent.');
+            break;
+          } else if (nextStepChoice === 'ai') {
+            // Let AI suggest next step
+            const availableActionsAI = flags.webSearch ? '"read"|"exec"|"write"|"search"' : '"read"|"exec"|"write"';
+            const askNext = `Given the goal: ${goal} and the history: ${JSON.stringify(history)}, return the NEXT step as a single JSON object or an empty array if done. Object format: {"action":${availableActionsAI},"target":"...","content":"..." (optional)}`;
+            const nextResp = await sendMessage(accessToken, [ { role: 'system', content: askNext }, { role: 'user', content: goal } ]);
+            const nextText = nextResp?.choices?.[0]?.message?.content || '';
+            const m = nextText.match(/\{[\s\S]*\}|\[[\s\S]*\]/);
+            let next;
+            if (m) {
+              try { next = JSON.parse(m[0]); } catch (e) { next = null; }
+            }
+            if (!next || (Array.isArray(next) && next.length === 0)) {
+              console.log('AI suggests no more steps needed.');
+              break;
+            }
+            if (!Array.isArray(next)) queue.push(next);
+          } else if (nextStepChoice && typeof nextStepChoice === 'object') {
+            // User provided manual step
+            queue.push(nextStepChoice);
+          } else {
+            // No valid choice, skip
+            continue;
+          }
+        }
+        
+        // Non-interactive mode: if queue empty, ask model for next step given history
+        if (queue.length === 0 && !flags.interactive) {
+          const availableActionsAI = flags.webSearch ? '"read"|"exec"|"write"|"search"' : '"read"|"exec"|"write"';
+          const askNext = `Given the goal: ${goal} and the history: ${JSON.stringify(history)}, return the NEXT step as a single JSON object or an empty array if done. Object format: {"action":${availableActionsAI},"target":"...","content":"..." (optional)}`;
           const nextResp = await sendMessage(accessToken, [ { role: 'system', content: askNext }, { role: 'user', content: goal } ]);
           const nextText = nextResp?.choices?.[0]?.message?.content || '';
           const m = nextText.match(/\{[\s\S]*\}|\[[\s\S]*\]/);
@@ -880,6 +1037,8 @@ async function main() {
           if (!next || (Array.isArray(next) && next.length === 0)) break;
           if (!Array.isArray(next)) queue.push(next);
         }
+
+        if (queue.length === 0) break; // No more steps
 
         const s = queue.shift();
         stepIndex++;
@@ -899,7 +1058,7 @@ async function main() {
           continue;
         }
 
-        // simulate: do not perform exec/write, but allow read
+        // simulate: do not perform exec/write, but allow read and search
         if (flags.simulate && (s.action === 'exec' || s.action === 'write')) {
           console.log('[simulate] Would execute:', s.action, s.target || '', s.content || '');
           history.push({ step: s, result: '[simulate] skipped' });
@@ -968,6 +1127,15 @@ async function main() {
           } catch (e) {
             console.error('Write failed:', e.message);
             history.push({ step: s, result: `write error: ${e.message}` });
+          }
+        } else if (s.action === 'search') {
+          try {
+            const searchResult = await performWebSearch(s.target);
+            console.log('Search results:\n', searchResult);
+            history.push({ step: s, result: searchResult });
+          } catch (e) {
+            console.error('Search failed:', e.message);
+            history.push({ step: s, result: `search error: ${e.message}` });
           }
         }
 
