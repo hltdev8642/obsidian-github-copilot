@@ -474,6 +474,7 @@ function printGeneralHelp() {
   console.log('    --web-search                 Enable web search capabilities');
   console.log('    --no-confirm-exec            Disable confirmation for exec steps');
   console.log('    --no-confirm-write           Disable confirmation for write steps');
+  console.log('    --no-confirm-search          Disable confirmation for search steps');
 }
 
 function printCommandHelp(command) {
@@ -742,7 +743,7 @@ async function main() {
       }
     } else if (cmd === 'agent') {
       // agent <goal> [--allow-exec] [--allow-write] [--max-steps N] [--dry-run] [--yes] [--whitelist a,b]
-  const flags = { allowExec: true, allowWrite: false, maxSteps: 5, dryRun: false, yes: false, whitelist: [], simulate: false, log: null, confirmExec: false, confirmWrite: true, confirmRead: false, interactive: false, webSearch: false };
+  const flags = { allowExec: true, allowWrite: false, maxSteps: 5, dryRun: false, yes: false, whitelist: [], simulate: false, log: null, confirmExec: false, confirmWrite: true, confirmRead: false, confirmSearch: false, interactive: false, webSearch: false };
       const rest = [];
       for (let i = 1; i < args.length; i++) {
         const a = args[i];
@@ -760,6 +761,8 @@ async function main() {
         else if (a === '--no-confirm-write') flags.confirmWrite = false;
         else if (a === '--confirm-read') flags.confirmRead = true;
         else if (a === '--no-confirm-read') flags.confirmRead = false;
+        else if (a === '--confirm-search') flags.confirmSearch = true;
+        else if (a === '--no-confirm-search') flags.confirmSearch = false;
         else if (a === '--interactive' || a === '-i') flags.interactive = true;
         else if (a === '--web-search') flags.webSearch = true;
         else rest.push(a);
@@ -881,17 +884,33 @@ async function main() {
               
               rl.question('Enter action: ', (actionInput) => {
                 rl.close();
-                const parts = actionInput.split(':');
+                
+                if (!actionInput || !actionInput.trim()) {
+                  console.log('Empty input. Skipping step.');
+                  resolve(null);
+                  return;
+                }
+                
+                const parts = actionInput.trim().split(':');
                 if (parts.length < 2) {
-                  console.log('Invalid format. Skipping step.');
+                  console.log('Invalid format. Expected: action:target[:content]');
+                  console.log('Examples: read:./file.txt, exec:ls -la, write:./out.txt:content');
                   resolve(null);
                 } else {
-                  const step = {
-                    action: parts[0],
-                    target: parts[1],
-                    content: parts[2] || undefined
-                  };
-                  resolve(step);
+                  const action = parts[0].toLowerCase();
+                  const validActions = flags.webSearch ? ['read', 'exec', 'write', 'search'] : ['read', 'exec', 'write'];
+                  
+                  if (!validActions.includes(action)) {
+                    console.log(`Invalid action: ${action}. Valid actions: ${validActions.join(', ')}`);
+                    resolve(null);
+                  } else {
+                    const step = {
+                      action: action,
+                      target: parts[1],
+                      content: parts.slice(2).join(':') || undefined // Handle content with colons
+                    };
+                    resolve(step);
+                  }
                 }
               });
             } else {
@@ -1070,6 +1089,7 @@ async function main() {
         if (s.action === 'exec') needsConfirm = !!flags.confirmExec;
         else if (s.action === 'write') needsConfirm = !!flags.confirmWrite;
         else if (s.action === 'read') needsConfirm = !!flags.confirmRead;
+        else if (s.action === 'search') needsConfirm = !!flags.confirmSearch;
 
         if (needsConfirm) {
           const proceed = await askConfirm(`Execute step ${stepIndex}: ${s.action} ${s.target || ''}?`);
