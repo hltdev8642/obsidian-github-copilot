@@ -25,7 +25,7 @@ _copilot_cli_completions() {
       fi
       COMPREPLY=( $(compgen -W "$opts" -- "$cur") ); return 0;;
     agent)
-  opts="--allow-exec --allow-write --max-steps --dry-run --simulate --yes --log --whitelist --workspace --workspace-depth --workspace-max-file --interactive -i --web-results --web-fetch --no-reflect"
+      opts="--allow-exec --allow-write --max-steps --dry-run --simulate --yes --log --whitelist --workspace --workspace-depth --workspace-max-file --interactive -i --web-results --web-fetch"
       if [[ "$prev" == "--log" ]]; then
         COMPREPLY=( $(compgen -f -- "$cur") ); return 0
       fi
@@ -59,3 +59,4 @@ _copilot_cli_completions() {
   esac
 }
 complete -F _copilot_cli_completions copilot-cli
+

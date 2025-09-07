@@ -60,8 +60,7 @@ case $state in
           '--interactive[Start interactive REPL]' \
           '-i[Start interactive REPL (short)]' \
           '--web-results[Default number of web results]:n:(3 5 10 15)' \
-          '--web-fetch[Default number of pages to fetch]:n:(0 1 2 3)' \
-          '--no-reflect[Disable automatic reflection on failures]'
+          '--web-fetch[Default number of pages to fetch]:n:(0 1 2 3)'
         ;;
       completion)
         compadd bash zsh fish powershell
@@ -72,3 +71,4 @@ case $state in
     esac
     ;;
 esac
+

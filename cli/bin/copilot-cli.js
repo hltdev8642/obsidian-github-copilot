@@ -1,4 +1,3 @@
-#!/usr/bin/env node
 // Minimal Copilot CLI
 // Usage:
 //   copilot-cli auth        -> start device-code auth flow and print PAT
@@ -200,6 +199,109 @@ function safeWriteRecursive(baseWorkspace, targetPath, content) {
   fs.writeFileSync(absTarget, content, 'utf8');
 }
 
+// ---- Simple workspace retrieval index ----
+function tokenize(text) {
+  return (text.toLowerCase().match(/[a-z0-9_]+/g) || []).filter(Boolean);
+}
+
+function buildWorkspaceIndex(base, opts = {}) {
+  const maxDepth = typeof opts.maxDepth === 'number' ? opts.maxDepth : Infinity;
+  const maxFileMB = (typeof opts.maxFileMB === 'number') ? opts.maxFileMB : null;
+  const chunkLines = opts.chunkLines || 200;
+  const docs = [];
+  function visit(filePath, rel, content) {
+    const lines = content.split(/\r?\n/);
+    for (let i = 0; i < lines.length; i += chunkLines) {
+      const slice = lines.slice(i, i + chunkLines);
+      const txt = slice.join('\n');
+      const tokens = tokenize(txt);
+      const tf = new Map();
+      for (const t of tokens) tf.set(t, (tf.get(t) || 0) + 1);
+      docs.push({ path: filePath, rel, start: i + 1, end: Math.min(i + chunkLines, lines.length), text: txt, tf, len: tokens.length || 1 });
+    }
+  }
+  function walk(dir, depth) {
+    if (depth > maxDepth) return;
+    let entries = [];
+    try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return; }
+    for (const ent of entries) {
+      const full = path.join(dir, ent.name);
+      const rel = path.relative(base, full);
+      if (ent.isDirectory()) walk(full, depth + 1);
+      else if (ent.isFile()) {
+        try {
+          const stat = fs.statSync(full);
+          const sizeMB = +(stat.size / (1024*1024)).toFixed(2);
+          if (maxFileMB !== null && sizeMB > maxFileMB) continue;
+          const txt = fs.readFileSync(full, 'utf8');
+          visit(full, rel, txt);
+        } catch {}
+      }
+    }
+  }
+  walk(base, 0);
+  return { base, docs };
+}
+
+function retrieveFromIndex(index, query, topK = 5) {
+  const qTokens = tokenize(query);
+  const qSet = new Set(qTokens);
+  const scores = [];
+  for (const d of index.docs) {
+    let score = 0;
+    for (const qt of qSet) {
+      score += (d.tf.get(qt) || 0) / d.len;
+    }
+    if (score > 0) scores.push({ score, doc: d });
+  }
+  scores.sort((a, b) => b.score - a.score);
+  return scores.slice(0, topK).map(s => ({
+    path: s.doc.path,
+    rel: s.doc.rel,
+    range: [s.doc.start, s.doc.end],
+    snippet: s.doc.text.length > 2000 ? s.doc.text.slice(0, 2000) + '\n...[truncated]...' : s.doc.text,
+    score: +s.score.toFixed(4)
+  }));
+}
+
+// Simple unified-like diff generator and patch applier
+function makeUnifiedDiff(relPath, oldText, newText) {
+  const oldLines = oldText === null || oldText === undefined ? [] : String(oldText).split(/\r?\n/);
+  const newLines = newText === null || newText === undefined ? [] : String(newText).split(/\r?\n/);
+  const header = `diff --git a/${relPath} b/${relPath}\n--- a/${relPath}\n+++ b/${relPath}\n@@ -1,${oldLines.length} +1,${newLines.length} @@\n`;
+  let hunk = '';
+  // Very simple: show removed lines then added lines. This is a coarse patch but works for previews
+  for (const l of oldLines) hunk += `-${l}\n`;
+  for (const l of newLines) hunk += `+${l}\n`;
+  return header + hunk;
+}
+
+function isGitRepo(dir) {
+  try {
+    const r = spawnSync('git', ['rev-parse', '--is-inside-work-tree'], { cwd: dir, stdio: 'ignore' });
+    return r.status === 0;
+  } catch (e) { return false; }
+}
+
+async function applyPatchText(patchText, baseDir) {
+  const tmp = path.join(os.tmpdir(), `copilot-cli-${Date.now()}.patch`);
+  fs.writeFileSync(tmp, patchText, 'utf8');
+  const cwd = baseDir || process.cwd();
+  let applied = false; let outMsg = '';
+  // try -p0 then -p1
+  for (const pflag of ['-p0', '-p1']) {
+    try {
+      const { stdout, stderr } = await exec(`git apply ${pflag} "${tmp}"`, { cwd, shell: detectShell(), windowsHide: true });
+      applied = true; outMsg = (stdout || '') + (stderr || ''); break;
+    } catch (e) {
+      outMsg = (e && e.message) ? e.message : String(e);
+    }
+  }
+  // remove temp file
+  try { fs.unlinkSync(tmp); } catch (e) {}
+  return { applied, outMsg };
+}
+
 // ...existing code...
 
 const homedir = os.homedir();
@@ -289,6 +391,37 @@ async function sendMessage(accessToken, messages) {
   });
   if (resp.status !== 200) throw new Error('Send message failed: ' + JSON.stringify(resp));
   return resp.json;
+}
+
+// --- Web search helpers (DuckDuckGo HTML) ---
+async function webSearch(query, maxResults = 5) {
+  const q = encodeURIComponent(query);
+  const url = `https://html.duckduckgo.com/html/?q=${q}`;
+  const resp = await fetch(url, { headers: { 'user-agent': 'Mozilla/5.0 copilot-cli' } });
+  const html = await resp.text();
+  // naive parse: find result links
+  const results = [];
+  const linkRe = /<a[^>]+class="result__a"[^>]+href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/ig;
+  let m;
+  while ((m = linkRe.exec(html)) !== null) {
+    const href = m[1];
+    const title = m[2].replace(/<[^>]+>/g, '').trim();
+    if (href && title) results.push({ title, url: href });
+    if (results.length >= maxResults) break;
+  }
+  return results;
+}
+
+async function fetchPage(url, maxChars = 4000) {
+  try {
+    const resp = await fetch(url, { headers: { 'user-agent': 'Mozilla/5.0 copilot-cli' } });
+    const text = await resp.text();
+    // strip tags; this is naive but ok for preview
+    const noTags = text.replace(/<script[\s\S]*?<\/script>/gi, '').replace(/<style[\s\S]*?<\/style>/gi, '').replace(/<[^>]+>/g, ' ');
+    return noTags.replace(/\s+/g, ' ').trim().slice(0, maxChars);
+  } catch (e) {
+    return `Failed to fetch page: ${e.message}`;
+  }
 }
 
 async function savePAT(pat) {
@@ -472,6 +605,10 @@ function printGeneralHelp() {
   console.log('    --log <file>                 Save agent history JSON to file');
   console.log('    --no-confirm-exec            Disable confirmation for exec steps');
   console.log('    --no-confirm-write           Disable confirmation for write steps');
+  console.log('    --interactive, -i            Start interactive REPL (step/run/search)');
+  console.log('    --web-results <N>            Default N results for interactive web search (default: 5)');
+  console.log('    --web-fetch <K>              Default K pages to fetch after search (default: 0)');
+  console.log('    --no-reflect                 Disable automatic reflection on failures');
   console.log('  completion <shell>         Output a shell completion script for bash|zsh|fish|powershell');
   console.log('                             Example: `copilot-cli completion bash > /etc/bash_completion.d/copilot-cli`');
 }
@@ -521,6 +658,10 @@ function printCommandHelp(command) {
       console.log('  --log <file>            Save agent history JSON to file');
       console.log('  --no-confirm-exec       Disable confirmation for exec steps');
       console.log('  --no-confirm-write      Disable confirmation for write steps');
+      console.log('  --interactive, -i       Start interactive REPL (step/run/search)');
+      console.log('  --web-results <N>       Default N results for interactive web search (default: 5)');
+      console.log('  --web-fetch <K>         Default K pages to fetch after search (default: 0)');
+  console.log('  --no-reflect            Disable automatic reflection on failures');
       console.log('\nExamples:');
       console.log('  copilot-cli agent "Summarize README.md" --dry-run');
       console.log('  copilot-cli agent "Inspect top-level files and summarize" --simulate --log ./agent-log.json');
@@ -533,7 +674,12 @@ function printCommandHelp(command) {
 
 function printCompletion(shell) {
   const sh = (shell || '').toLowerCase();
-  const base = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', 'completions');
+      let base;
+      try {
+        base = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', 'completions');
+      } catch (e) {
+        base = path.resolve(process.cwd(), 'cli', 'completions');
+      }
   const map = {
     'bash': 'copilot-cli.bash',
     'zsh': 'copilot-cli.zsh',
@@ -604,7 +750,22 @@ async function main() {
         process.exit(1);
       }
       try {
-        fs.writeFileSync(path.resolve(target), data, 'utf8');
+        // Prepare patch preview
+        const absTarget = path.resolve(target);
+        let oldText = '';
+        try { oldText = fs.existsSync(absTarget) ? fs.readFileSync(absTarget, 'utf8') : ''; } catch (e) { oldText = ''; }
+        const patch = makeUnifiedDiff(path.relative(process.cwd(), absTarget), oldText, data);
+        console.log('Proposed patch:\n');
+        console.log(patch);
+        // ask for confirmation
+        const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+        const ok = await new Promise((res) => rl.question('Apply this patch? (y/n) ', (ans) => { rl.close(); res(/^y(es)?$/i.test(ans.trim())); }));
+        if (!ok) { console.log('User declined.'); process.exit(0); }
+        fs.writeFileSync(absTarget, data, 'utf8');
+        // try git apply if repo
+        if (isGitRepo(process.cwd())) {
+          try { const r = await applyPatchText(patch, process.cwd()); if (!r.applied) console.log('Warning: git apply failed:', r.outMsg); } catch (e) { /* ignore */ }
+        }
         console.log('Wrote', target);
       } catch (e) {
         console.error('Failed to write file:', e.message);
@@ -768,7 +929,7 @@ async function main() {
       process.exit(0);
     } else if (cmd === 'agent') {
       // agent <goal> [--allow-exec] [--allow-write] [--max-steps N] [--dry-run] [--yes] [--whitelist a,b]
-  const flags = { allowExec: true, allowWrite: false, maxSteps: 5, dryRun: false, yes: false, whitelist: [], simulate: false, log: null, confirmExec: false, confirmWrite: true, confirmRead: false };
+  const flags = { allowExec: true, allowWrite: false, maxSteps: 5, dryRun: false, yes: false, whitelist: [], simulate: false, log: null, confirmExec: false, confirmWrite: true, confirmRead: false, interactive: false, webResults: 5, webFetch: 0, reflect: true };
       const rest = [];
       for (let i = 1; i < args.length; i++) {
         const a = args[i];
@@ -786,10 +947,14 @@ async function main() {
         else if (a === '--no-confirm-write') flags.confirmWrite = false;
         else if (a === '--confirm-read') flags.confirmRead = true;
         else if (a === '--no-confirm-read') flags.confirmRead = false;
+        else if (a === '--interactive' || a === '-i') flags.interactive = true;
+        else if (a === '--web-results') flags.webResults = parseInt(args[++i] || '5', 10) || 5;
+        else if (a === '--web-fetch') flags.webFetch = parseInt(args[++i] || '0', 10) || 0;
+        else if (a === '--no-reflect') flags.reflect = false;
         else rest.push(a);
       }
 
-      const goal = rest.join(' ');
+  let goal = rest.join(' ');
       if (!goal) {
         console.error('Usage: copilot-cli agent <goal> [--allow-exec] [--allow-write] [--max-steps N] [--dry-run] [--yes] [--whitelist a,b]');
         process.exit(1);
@@ -800,9 +965,10 @@ async function main() {
         if (!step || typeof step !== 'object') return 'Step is not an object';
         if (!step.action || typeof step.action !== 'string') return 'Missing or invalid action';
         const act = step.action.toLowerCase();
-        if (!['read', 'exec', 'write'].includes(act)) return `Invalid action: ${step.action}`;
-        if (!step.target || typeof step.target !== 'string') return 'Missing or invalid target';
+        if (!['read', 'exec', 'write', 'retrieve', 'apply_patch'].includes(act)) return `Invalid action: ${step.action}`;
+        if (act !== 'apply_patch' && (!step.target || typeof step.target !== 'string')) return 'Missing or invalid target';
         if (act === 'write' && (typeof step.content !== 'string')) return 'Write action requires content string';
+        if (act === 'apply_patch' && (typeof step.content !== 'string')) return 'apply_patch requires diff content string';
         // whitelist check if provided
         if (flags.whitelist.length > 0) {
           const ok = flags.whitelist.some(w => step.target.includes(w) || (step.content && step.content.includes(w)));
@@ -824,7 +990,7 @@ async function main() {
       }
 
       // initial plan prompt
-      const planRequest = `You are an autonomous assistant that generates a plan of actions for a runtime to perform.\nGiven the goal: ${goal}\nReturn ONLY a JSON array (no surrounding text) where each element is an object with exactly these fields:\n- action: one of \"read\", \"exec\", \"write\"\n- target: path (for read/write) or command (for exec)\n- content: (optional) for write actions\nExample: [{"action":"read","target":"./README.md"},{"action":"exec","target":"ls -la"},{"action":"write","target":"./out.txt","content":"result"}]\nOutput nothing else.`;
+  const planRequest = `You are an autonomous assistant that generates a plan of actions for a runtime to perform.\nGiven the goal: ${goal}\nReturn ONLY a JSON array (no surrounding text) where each element has:\n- action: one of \"read\", \"exec\", \"write\", \"retrieve\", \"apply_patch\"\n- target: path (for read/write), command (for exec), query (for retrieve), or description (for apply_patch)\n- content: (optional) for write and apply_patch (unified diff as text)\n- topK: (optional, number) for retrieve\nExample: [{"action":"retrieve","target":"top functions in src","topK":5},{"action":"read","target":"./README.md"},{"action":"exec","target":"ls -la"},{"action":"apply_patch","target":"refactor foo","content":"diff --git a/src/a.js b/src/a.js\n..."}]\nOutput nothing else.`;
 
       // get access token
       let pat = process.env.COPILOT_PAT || readPATFromFile();
@@ -872,8 +1038,8 @@ async function main() {
         process.exit(1);
       }
 
-      // iterative execution: we treat plan as a queue and after each action we can ask the model for next step
-      let queue = [...plan];
+  // iterative execution: we treat plan as a queue and after each action we can ask the model for next step
+  let queue = [...plan];
       let stepIndex = 0;
       const history = [];
       // workspace flags for agent
@@ -893,6 +1059,210 @@ async function main() {
         return out;
       }
       const wsFlagsAgent = extractWorkspaceFlagsAgent();
+      // Build retrieval index if workspace provided
+      let wsIndex = null;
+      if (wsFlagsAgent.workspace) {
+        try {
+          wsIndex = buildWorkspaceIndex(path.resolve(wsFlagsAgent.workspace), { maxDepth: wsFlagsAgent.depth, maxFileMB: wsFlagsAgent.maxFileMB, chunkLines: 200 });
+        } catch (e) { console.warn('Index build failed:', e.message); }
+      }
+
+      // Interactive REPL
+      if (flags.interactive) {
+        console.log('Interactive agent mode. Type "help" for commands. Goal:', goal);
+        const rl = readline.createInterface({ input: process.stdin, output: process.stdout, historySize: 1000 });
+        let lastSearch = [];
+        const prompt = () => rl.prompt();
+        rl.setPrompt('agent> ');
+        rl.on('line', async (line) => {
+          const input = line.trim();
+          if (!input) return prompt();
+          const [cmd0, ...restParts] = input.split(' ');
+          const argStr = restParts.join(' ').trim();
+          try {
+            switch (cmd0.toLowerCase()) {
+              case 'h':
+              case 'help':
+                console.log('Commands:');
+                console.log('  plan                Regenerate plan from goal');
+                console.log('  next                Ask model for next step and enqueue');
+                console.log('  run                 Execute next step in queue');
+                console.log('  run all             Execute steps until queue empty or max-steps');
+                console.log('  show                Show queued steps');
+                console.log('  history             Show step history');
+                console.log('  read <path>         Read a file (workspace constrained if set)');
+                console.log('  write <path> <txt>  Write text to file (allow-write required)');
+                console.log('  exec <cmd>          Execute a shell command (allow-exec required)');
+                console.log('  search <query>      Web search via DuckDuckGo');
+                console.log('  open <n>            Fetch nth result from last search');
+                console.log('  goal <new text>     Update the goal');
+                console.log('  quit/exit           Quit interactive mode');
+                break;
+              case 'plan': {
+                const planResp2 = await sendMessage(accessToken, [ { role: 'system', content: planRequest }, { role: 'user', content: goal } ]);
+                const txt = planResp2?.choices?.[0]?.message?.content || '';
+                let p; const m3 = txt.match(/\{[\s\S]*\}|\[[\s\S]*\]/);
+                if (m3) { try { p = JSON.parse(m3[0]); } catch {}
+                }
+                if (Array.isArray(p)) { queue = [...p]; console.log('Plan updated. Steps:', p.length); }
+                else console.log('Failed to parse plan. Raw:', txt.substring(0, 500));
+                break; }
+              case 'next': {
+                const askNext = `Given the goal: ${goal} and the history: ${JSON.stringify(history)}, return the NEXT step as a single JSON object or an empty array if done. Object format: {"action":"read"|"exec"|"write","target":"...","content":"..." (optional)}`;
+                const nextResp = await sendMessage(accessToken, [ { role: 'system', content: askNext }, { role: 'user', content: goal } ]);
+                const nextText = nextResp?.choices?.[0]?.message?.content || '';
+                const m4 = nextText.match(/\{[\s\S]*\}|\[[\s\S]*\]/);
+                if (m4) { try { const n = JSON.parse(m4[0]); if (!Array.isArray(n)) queue.push(n); console.log('Enqueued next step.'); } catch { console.log('Failed to parse next step.'); } }
+                else console.log('No next step.');
+                break; }
+              case 'show':
+                console.log('Queue:', queue);
+                break;
+              case 'history':
+                console.log('History length:', history.length);
+                for (let i=0;i<history.length;i++) console.log(`#${i+1}`, history[i].step, String(history[i].result).slice(0,200));
+                break;
+              case 'read': {
+                const target = argStr;
+                if (!target) { console.log('Usage: read <path>'); break; }
+                const s = { action: 'read', target };
+                const err = validateStep(s); if (err) { console.log('Invalid:', err); break; }
+                try {
+                  const full = path.resolve(target);
+                  if (wsFlagsAgent.workspace && !isPathInside(path.resolve(wsFlagsAgent.workspace), full)) throw new Error('Read target outside of workspace');
+                  const content = fs.readFileSync(full, 'utf8');
+                  console.log(content.substring(0, 4000));
+                  history.push({ step: s, result: content });
+                } catch (e) { console.log('Read failed:', e.message); }
+                break; }
+              case 'write': {
+                const sp = argStr.split(' ');
+                const target = sp.shift();
+                const text = sp.join(' ');
+                if (!target || text === undefined) { console.log('Usage: write <path> <text>'); break; }
+                if (!flags.allowWrite) { console.log('Write not allowed. Enable --allow-write.'); break; }
+                try {
+                  const absTarget = wsFlagsAgent.workspace ? path.resolve(wsFlagsAgent.workspace, target) : path.resolve(target);
+                  let oldText = '';
+                  try { oldText = fs.existsSync(absTarget) ? fs.readFileSync(absTarget, 'utf8') : ''; } catch (e) { oldText = ''; }
+                  const patch = makeUnifiedDiff(path.relative(wsFlagsAgent.workspace || process.cwd(), absTarget), oldText, text);
+                  console.log('Proposed patch:\n');
+                  console.log(patch);
+                  const doApply = await askConfirm('Apply this patch?');
+                  if (!doApply) { console.log('User declined.'); break; }
+                  if (wsFlagsAgent.workspace) safeWriteRecursive(wsFlagsAgent.workspace, target, text); else fs.writeFileSync(absTarget, text, 'utf8');
+                  // try to git apply if repo present
+                  if (isGitRepo(wsFlagsAgent.workspace || process.cwd())) {
+                    try { const r = await applyPatchText(patch, wsFlagsAgent.workspace || process.cwd()); if (!r.applied) console.log('Patch write applied but git apply failed:', r.outMsg); }
+                    catch (e) { /* ignore git apply errors */ }
+                  }
+                  console.log('Wrote to', target); history.push({ step: { action: 'write', target, content: text }, result: 'written' });
+                } catch (e) { console.log('Write failed:', e.message); }
+                break; }
+              case 'exec': {
+                const cmdline = argStr;
+                if (!cmdline) { console.log('Usage: exec <command>'); break; }
+                if (!flags.allowExec) { console.log('Exec not allowed. Enable --allow-exec.'); break; }
+                try { const { stdout, stderr } = await runCommand(normalizeCommand(cmdline));
+                  if (stdout) process.stdout.write(stdout); if (stderr) process.stderr.write(stderr);
+                  history.push({ step: { action: 'exec', target: cmdline }, result: (stdout || stderr || '').slice(0, 4000) }); } catch (e) { console.log('Exec failed:', e.message); }
+                break; }
+              case 'search': {
+                const q = argStr || goal;
+                if (!q) { console.log('Usage: search <query>'); break; }
+                const res = await webSearch(q, flags.webResults);
+                lastSearch = res;
+                if (!res.length) { console.log('No results.'); break; }
+                res.forEach((r, i) => console.log(`${i+1}. ${r.title} - ${r.url}`));
+                if (flags.webFetch > 0) {
+                  const k = Math.min(flags.webFetch, res.length);
+                  for (let i=0; i<k; i++) {
+                    console.log(`\nFetching [${i+1}] ${res[i].url}`);
+                    const content = await fetchPage(res[i].url, 2000);
+                    console.log(content);
+                    history.push({ step: { action: 'read', target: res[i].url }, result: content });
+                  }
+                }
+                break; }
+              case 'retrieve': {
+                const q = argStr || goal;
+                if (!q) { console.log('Usage: retrieve <query>'); break; }
+                try {
+                  if (!wsIndex && wsFlagsAgent.workspace) {
+                    wsIndex = buildWorkspaceIndex(path.resolve(wsFlagsAgent.workspace), { maxDepth: wsFlagsAgent.depth, maxFileMB: wsFlagsAgent.maxFileMB, chunkLines: 200 });
+                  }
+                  const res = wsIndex ? retrieveFromIndex(wsIndex, q, 5) : [];
+                  if (!res.length) { console.log('(no results)'); break; }
+                  res.forEach((r,i)=>{
+                    console.log(`${i+1}. ${r.rel}:${r.range[0]}-${r.range[1]} (score=${r.score})`);
+                    console.log(r.snippet);
+                    console.log();
+                  });
+                  history.push({ step: { action: 'retrieve', target: q, topK: 5 }, result: JSON.stringify(res) });
+                } catch (e) { console.log('Retrieve failed:', e.message); }
+                break; }
+              case 'open': {
+                const idx = parseInt(argStr, 10) || 0;
+                if (idx < 1 || idx > lastSearch.length) { console.log('Usage: open <n> (from last search)'); break; }
+                const r = lastSearch[idx-1];
+                console.log('Fetching', r.url);
+                const content = await fetchPage(r.url, 4000);
+                console.log(content);
+                history.push({ step: { action: 'read', target: r.url }, result: content });
+                break; }
+              case 'goal':
+                if (!argStr) { console.log('Current goal:', goal); break; }
+                goal = argStr; queue = []; console.log('Goal updated.');
+                break;
+              case 'run': {
+                const restRun = argStr.toLowerCase();
+                const runOne = async () => {
+                  if (queue.length === 0) { console.log('Queue empty. Use next or plan.'); return; }
+                  const s = queue.shift();
+                  stepIndex++;
+                  console.log(`Step ${stepIndex}:`, s.action, s.target || '');
+                  const validationError = validateStep(s); if (validationError) { console.log('Invalid step:', validationError); history.push({ step: s, result: `invalid: ${validationError}` }); return; }
+                  // execute (reuse non-interactive logic subset)
+                  if (s.action === 'read') {
+                    try { const full = path.resolve(s.target); if (wsFlagsAgent.workspace && !isPathInside(path.resolve(wsFlagsAgent.workspace), full)) throw new Error('Read target outside of workspace'); const content = fs.readFileSync(full, 'utf8'); console.log(content.substring(0, 2000)); history.push({ step: s, result: content }); } catch (e) { console.log('Read failed:', e.message); history.push({ step: s, result: `read error: ${e.message}` }); }
+                  } else if (s.action === 'exec') {
+                    if (!flags.allowExec) { console.log('Exec not allowed.'); history.push({ step: s, result: 'exec not allowed' }); }
+                    else { try { const { stdout, stderr } = await runCommand(normalizeCommand(s.target)); console.log(stdout || ''); if (stderr) console.error(stderr); history.push({ step: s, result: stdout || stderr || '' }); } catch (e) { console.log('Exec failed:', e.message); history.push({ step: s, result: `exec error: ${e.message}` }); } }
+                  } else if (s.action === 'write') {
+                    if (!flags.allowWrite) { console.log('Write not allowed.'); history.push({ step: s, result: 'write not allowed' }); }
+                    else { try { if (wsFlagsAgent.workspace) safeWriteRecursive(wsFlagsAgent.workspace, s.target, s.content || ''); else fs.writeFileSync(path.resolve(s.target), s.content || '', 'utf8'); console.log('Wrote to', s.target); history.push({ step: s, result: 'written' }); } catch (e) { console.log('Write failed:', e.message); history.push({ step: s, result: `write error: ${e.message}` }); } }
+                  }
+                };
+                if (restRun === 'all') {
+                  let count = 0;
+                  while (count < flags.maxSteps) { if (queue.length === 0) break; await runOne(); count++; }
+                } else {
+                  await runOne();
+                }
+                break; }
+              case 'quit':
+              case 'exit':
+                rl.close();
+                return;
+              default:
+                console.log('Unknown command. Type "help".');
+            }
+          } catch (e) {
+            console.log('Error:', e.message);
+          } finally {
+            prompt();
+          }
+        }).on('close', () => {
+          console.log('Exiting interactive agent.');
+          // write log if requested
+          if (flags.log) {
+            try { fs.writeFileSync(path.resolve(flags.log), JSON.stringify({ goal, flags, history }, null, 2), 'utf8'); console.log('Agent history written to', flags.log); } catch (e) { console.error('Failed to write agent log:', e.message); }
+          }
+          process.exit(0);
+        });
+        prompt();
+        return; // do not continue into non-interactive loop
+      }
 
   while (stepIndex < flags.maxSteps) {
         // if queue empty, ask model for next step given history
@@ -909,7 +1279,7 @@ async function main() {
           if (!Array.isArray(next)) queue.push(next);
         }
 
-        const s = queue.shift();
+  const s = queue.shift();
         stepIndex++;
         console.log(`Step ${stepIndex}:`, s.action, s.target || '');
 
@@ -949,7 +1319,7 @@ async function main() {
           }
         }
 
-        // execute
+  // execute
         if (s.action === 'read') {
           try {
             const full = path.resolve(s.target);
@@ -997,6 +1367,101 @@ async function main() {
             console.error('Write failed:', e.message);
             history.push({ step: s, result: `write error: ${e.message}` });
           }
+        } else if (s.action === 'retrieve') {
+          try {
+            const q = s.target || '';
+            const k = typeof s.topK === 'number' ? s.topK : 5;
+            if (!wsIndex && wsFlagsAgent.workspace) {
+              wsIndex = buildWorkspaceIndex(path.resolve(wsFlagsAgent.workspace), { maxDepth: wsFlagsAgent.depth, maxFileMB: wsFlagsAgent.maxFileMB, chunkLines: 200 });
+            }
+            const results = wsIndex ? retrieveFromIndex(wsIndex, q, k) : [];
+            const text = results.map(r => `${r.rel}:${r.range[0]}-${r.range[1]} (score=${r.score})\n${r.snippet}`).join('\n\n');
+            console.log('Retrieve results:\n', text.substring(0, 4000) || '(none)');
+            history.push({ step: s, result: text });
+          } catch (e) {
+            console.error('Retrieve failed:', e.message);
+            history.push({ step: s, result: `retrieve error: ${e.message}` });
+          }
+        } else if (s.action === 'apply_patch') {
+          if (!flags.allowWrite) {
+            console.warn('Apply patch not allowed (requires --allow-write). Skipping.');
+            history.push({ step: s, result: 'apply_patch not allowed' });
+          } else {
+            try {
+              const patchText = s.content || '';
+              if (!patchText.trim()) throw new Error('Empty patch content');
+              // Attempt to extract file paths for safety check
+              const pathsInPatch = Array.from(patchText.matchAll(/^\+\+\+\s+\S*?([^\s\n]+)$/gm)).map(m => m[1]).filter(Boolean);
+              if (wsFlagsAgent.workspace && pathsInPatch.length) {
+                const base = path.resolve(wsFlagsAgent.workspace);
+                for (const p of pathsInPatch) {
+                  // strip a/ or b/
+                  const clean = p.replace(/^a\//, '').replace(/^b\//, '');
+                  const abs = path.resolve(base, clean);
+                  if (!isPathInside(base, abs)) throw new Error(`Patch modifies path outside workspace: ${clean}`);
+                }
+              }
+              const proceed = flags.yes ? true : await new Promise((resolve)=>{
+                const rl2 = readline.createInterface({ input: process.stdin, output: process.stdout });
+                rl2.question('Apply patch? (y/n) ', ans=>{ rl2.close(); resolve(/^y(es)?$/i.test(ans.trim())); });
+              });
+              if (!proceed) { console.log('User declined patch.'); history.push({ step: s, result: 'user declined patch' }); }
+              else {
+                // write patch to temp file and try git apply
+                // show preview
+                console.log('Patch preview:\n');
+                console.log(patchText.substring(0, 20000));
+                const proceedApply = flags.yes ? true : await new Promise((resolve)=>{
+                  const rl3 = readline.createInterface({ input: process.stdin, output: process.stdout });
+                  rl3.question('Apply patch? (y/n) ', ans=>{ rl3.close(); resolve(/^y(es)?$/i.test(ans.trim())); });
+                });
+                if (!proceedApply) { console.log('User declined patch.'); history.push({ step: s, result: 'user declined patch' }); }
+                else {
+                  // try git apply using helper; if git apply fails but not a git repo, fallback to direct writes
+                  let appliedObj = { applied: false, outMsg: '' };
+                  if (isGitRepo(wsFlagsAgent.workspace || process.cwd())) {
+                    appliedObj = await applyPatchText(patchText, wsFlagsAgent.workspace || process.cwd());
+                    if (!appliedObj.applied) throw new Error('git apply failed: ' + appliedObj.outMsg);
+                  } else {
+                    // naive apply: parse patch hunks and write file content directly (simple fallback)
+                    try {
+                      // Very simple: look for +++ b/<path> then read new content from + lines
+                      const m = patchText.match(/\+\+\+ b\/(.+)\n([\s\S]*)$/m);
+                      if (m) {
+                        const rel = m[1].trim();
+                        const newLines = patchText.split(/\r?\n/).filter(l => l.startsWith('+') && !l.startsWith('+++')).map(l => l.slice(1));
+                        const newText = newLines.join('\n');
+                        const abs = wsFlagsAgent.workspace ? path.resolve(wsFlagsAgent.workspace, rel) : path.resolve(rel);
+                        if (wsFlagsAgent.workspace && !isPathInside(path.resolve(wsFlagsAgent.workspace), abs)) throw new Error('Patch target outside workspace');
+                        fs.mkdirSync(path.dirname(abs), { recursive: true });
+                        fs.writeFileSync(abs, newText, 'utf8');
+                        appliedObj.applied = true; appliedObj.outMsg = 'wrote file(s) directly (fallback)';
+                      } else throw new Error('Patch format not recognized for fallback');
+                  } catch (e) { throw new Error('Fallback write failed: ' + e.message); }
+                  }
+                  console.log('Patch applied.');
+                  history.push({ step: s, result: 'patch applied' });
+                }
+              }
+            } catch (e) {
+              console.error('Apply patch failed:', e.message);
+              history.push({ step: s, result: `apply_patch error: ${e.message}` });
+            }
+          }
+        }
+
+        // automatic reflection on failures to propose next step
+        const last = history[history.length-1];
+        if (flags.reflect && last && typeof last.result === 'string' && /\b(error|failed)\b/i.test(last.result)) {
+          try {
+            const reflectPrompt = `Previous step failed. Goal: ${goal}. Last step: ${JSON.stringify(last.step)}. Error: ${last.result}. Suggest ONE next step as a JSON object: {"action":"read"|"exec"|"write"|"retrieve"|"apply_patch","target":"...","content":"..." (optional),"topK":(optional number)}. Output JSON only.`;
+            const r = await sendMessage(accessToken, [ { role: 'system', content: reflectPrompt }, { role: 'user', content: goal } ]);
+            const txt = r?.choices?.[0]?.message?.content || '';
+            const m = txt.match(/\{[\s\S]*\}/);
+            if (m) {
+              try { const obj = JSON.parse(m[0]); queue.unshift(obj); console.log('Reflection enqueued a recovery step.'); } catch {}
+            }
+          } catch (e) { /* ignore reflect failures */ }
         }
 
         // after each step, we optionally ask the model for a next step; loop continues
@@ -1021,8 +1486,8 @@ async function main() {
   }
 }
 
-// Node 18+ has global fetch. For older Node, user will need to install node-fetch.
-if (typeof fetch === 'undefined') {
+async function ensureFetchAvailable() {
+  if (typeof fetch !== 'undefined') return;
   try {
     const nodeFetch = await import('node-fetch');
     global.fetch = nodeFetch.default;
@@ -1032,4 +1497,5 @@ if (typeof fetch === 'undefined') {
   }
 }
 
+await ensureFetchAvailable();
 main();

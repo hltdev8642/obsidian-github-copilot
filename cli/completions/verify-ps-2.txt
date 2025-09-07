@@ -48,8 +48,7 @@ Register-ArgumentCompleter -CommandName 'copilot-cli' -ScriptBlock {
       @{Label='--interactive'; Tooltip='Start interactive REPL'},
       @{Label='-i'; Tooltip='Start interactive REPL (short)'},
       @{Label='--web-results'; Tooltip='Default number of web results'},
-      @{Label='--web-fetch'; Tooltip='Default number of pages to fetch'},
-      @{Label='--no-reflect'; Tooltip='Disable automatic reflection on failures'}
+      @{Label='--web-fetch'; Tooltip='Default number of pages to fetch'}
     )) { $results += [CompletionResult]::new($nf.Label, $nf.Label, 'ParameterName', $nf.Tooltip) }
     if ($wordToComplete -like './*' -or $wordToComplete -like '.\*') {
       Get-ChildItem -Directory -Name -ErrorAction SilentlyContinue | ForEach-Object { $results += [CompletionResult]::new($_, $_, 'ParameterValue', 'directory') }
@@ -68,3 +67,4 @@ Register-ArgumentCompleter -CommandName 'copilot-cli' -ScriptBlock {
     $results
   }
 }
+
