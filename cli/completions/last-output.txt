@@ -1,0 +1,23 @@
+# bash completion for copilot-cli
+_copilot_cli_completions() {
+  local cur prev cmds opts
+  COMPREPLY=()
+  cur="${COMP_WORDS[COMP_CWORD]}"
+  prev="${COMP_WORDS[COMP_CWORD-1]}"
+  cmds="auth chat read write exec agent completion"
+  opts="--read --exec --write --workspace --workspace-depth --workspace-max-file --allow-exec --allow-write --max-steps --dry-run --simulate --yes -y --log --no-confirm-exec --no-confirm-write --confirm-exec --confirm-write --confirm-read --no-confirm-read"
+  if [[ ${COMP_CWORD} == 1 ]]; then
+    COMPREPLY=( $(compgen -W "$cmds" -- $cur) )
+    return 0
+  fi
+  case ${COMP_WORDS[1]} in
+    chat)
+      COMPREPLY=( $(compgen -W "--read --exec --write --workspace --workspace-depth --workspace-max-file" -- $cur) ); return 0;;
+    agent)
+      COMPREPLY=( $(compgen -W "--allow-exec --allow-write --max-steps --dry-run --simulate --yes --log --whitelist --workspace --workspace-depth --workspace-max-file" -- $cur) ); return 0;;
+    completion)
+      COMPREPLY=( $(compgen -W "bash zsh fish powershell" -- $cur) ); return 0;;
+  esac
+}
+complete -F _copilot_cli_completions copilot-cli
+

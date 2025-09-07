@@ -1,0 +1,70 @@
+#compdef copilot-cli
+local context state line
+typeset -A opt_args
+_arguments -C \
+  '-h[help]' \
+  '--help[help]' \
+  '--read=[Include file contents as system context]:path:_files' \
+  '--exec=[Execute a command and include output as context]:command:' \
+  '--write=[Write message to file before sending]:path:_files' \
+  '--workspace=[Include workspace snapshot]:path:_files' \
+  '--workspace-depth=[Max recursion depth]:depth:({1..20})' \
+  '--workspace-max-file=[Max file size in MB]:size:({0.1,1,5,10,50,100})' \
+  '--allow-exec[Allow exec steps]' \
+  '--allow-write[Allow write steps]' \
+  '--max-steps=[Maximum steps]:n:({1..20})' \
+  '--dry-run[Do not execute steps]' \
+  '--simulate[Skip exec/write but allow reads]' \
+  '--yes[Auto-confirm]' \
+  '--log=[Save agent history JSON to file]:file:_files' \
+  '1:command:->command' \
+  '*::args:->args'
+case $state in
+  command)
+    local -a commands
+    commands=( \
+      'auth:Start auth' \
+      'chat:Send a chat message' \
+      'read:Print file contents' \
+      'write:Write content' \
+      'exec:Execute command' \
+      'agent:Run autonomous agent' \
+      'completion:Output shell completion' \
+    )
+    _describe -t commands 'copilot command' commands
+    ;;
+  args)
+    case $words[1] in
+      chat)
+        _arguments \
+          '--read=[Include file contents as system context]:file:_files' \
+          '--exec=[Execute a command and include output as context]:command' \
+          '--write=[Write message to file before sending]:file:_files' \
+          '--workspace=[Include workspace snapshot]:directory:_files' \
+          '--workspace-depth=[Max recursion depth]:depth:({1..20})' \
+          '--workspace-max-file=[Max file size in MB]:size:({0.1,1,5,10,50,100})'
+        ;;
+      agent)
+        _arguments \
+          '--allow-exec[Allow exec steps]' \
+          '--allow-write[Allow write steps]' \
+          '--max-steps=[Maximum steps]:n:({1..20})' \
+          '--dry-run[Plan only, do not execute]' \
+          '--simulate[Simulate actions without side-effects]' \
+          '--yes[Auto-confirm prompts]' \
+          '--log=[Save agent history JSON to file]:file:_files' \
+          '--whitelist=[Comma separated file globs to allow]:pattern:' \
+          '--workspace=[Workspace path]:directory:_files' \
+          '--workspace-depth=[Max recursion depth]:depth:({1..20})' \
+          '--workspace-max-file=[Max file size in MB]:size:({0.1,1,5,10,50,100})'
+        ;;
+      completion)
+        compadd bash zsh fish powershell
+        ;;
+      read|write)
+        _files
+        ;;
+    esac
+    ;;
+esac
+

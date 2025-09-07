@@ -28,3 +28,5 @@ secure-credentials.dat
 copilot/
 copilot-*/
 !copilot-chat/
+
+ref

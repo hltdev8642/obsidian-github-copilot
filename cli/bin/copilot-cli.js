@@ -472,6 +472,8 @@ function printGeneralHelp() {
   console.log('    --log <file>                 Save agent history JSON to file');
   console.log('    --no-confirm-exec            Disable confirmation for exec steps');
   console.log('    --no-confirm-write           Disable confirmation for write steps');
+  console.log('  completion <shell>         Output a shell completion script for bash|zsh|fish|powershell');
+  console.log('                             Example: `copilot-cli completion bash > /etc/bash_completion.d/copilot-cli`');
 }
 
 function printCommandHelp(command) {
@@ -529,6 +531,28 @@ function printCommandHelp(command) {
   }
 }
 
+function printCompletion(shell) {
+  const sh = (shell || '').toLowerCase();
+  const base = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', 'completions');
+  const map = {
+    'bash': 'copilot-cli.bash',
+    'zsh': 'copilot-cli.zsh',
+    'fish': 'copilot-cli.fish',
+    'powershell': 'copilot-cli.ps1'
+  };
+  const fname = map[sh];
+  if (!fname) {
+    console.log('Supported shells: bash, zsh, fish, powershell');
+    return;
+  }
+  const full = path.join(base, fname);
+  try {
+    const content = fs.readFileSync(full, 'utf8');
+    console.log(content);
+  } catch (e) {
+    console.error('Completion script not found for', sh, '-', full);
+  }
+  }
 async function main() {
   const args = process.argv.slice(2);
   const helpFlags = new Set(['help', '--help', '-help', 'h', '--h', '-h']);
@@ -738,6 +762,10 @@ async function main() {
       } else {
         await doChat(msg, systemParts);
       }
+    } else if (cmd === 'completion') {
+      const shell = args[1] || 'bash';
+      printCompletion(shell);
+      process.exit(0);
     } else if (cmd === 'agent') {
       // agent <goal> [--allow-exec] [--allow-write] [--max-steps N] [--dry-run] [--yes] [--whitelist a,b]
   const flags = { allowExec: true, allowWrite: false, maxSteps: 5, dryRun: false, yes: false, whitelist: [], simulate: false, log: null, confirmExec: false, confirmWrite: true, confirmRead: false };

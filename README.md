@@ -101,7 +101,9 @@ Important behavior and defaults:
 Example usage (sandboxed):
 
 ```bash
-node cli/bin/copilot-cli.js agent "List files and append a summary to summary.txt" --workspace ./cli/test-workspace --workspace-depth 2 --workspace-max-file-kb 50 --dry-run --log ./cli/agent-log.json
+node cli/bin/copilot-cli.js agent "List files and append a summary to summary.txt" --workspace ./cli/test-workspace --workspace-depth 2 --workspace-max-file 50 --dry-run --log ./cli/agent-log.json
 ```
+
+Shell completions for bash/zsh/fish/powershell are available via `cli/completions` and can be installed as described in `cli/README.md`.
 
 Note: Always test agent runs in a sandboxed workspace before running on sensitive data. The workspace flags are intended to reduce accidental access, but are not a substitute for careful review of agent plans.
