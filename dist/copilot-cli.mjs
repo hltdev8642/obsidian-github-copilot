@@ -3505,7 +3505,7 @@ async function doChat(message, systemParts = []) {
     }
     return out;
   }
-  const wsFlags2 = extractWorkspaceFlags();
+  const wsFlags = extractWorkspaceFlags();
   let pat = process.env.COPILOT_PAT || readPATFromFile();
   if (!pat) {
     console.error("No PAT found. Run `copilot-cli auth` first or set COPILOT_PAT env var.");
@@ -3625,6 +3625,9 @@ function printCommandHelp(command) {
       console.log("  --read <path>    Include file contents as system context");
       console.log("  --exec <cmd>     Execute a command and include output as context");
       console.log("  --write <path>   Write the message to a file before sending");
+      console.log("  --workspace <dir>            Include a workspace snapshot (recursive) as system context");
+      console.log("  --workspace-depth <N>        Max recursion depth for workspace snapshot (default: unlimited)");
+      console.log("  --workspace-max-file <M>     Max file size (MB) to include content in snapshot (default: unlimited)");
       console.log("\nExamples:");
       console.log('  copilot-cli chat "Summarize the repo"');
       console.log('  copilot-cli chat --read ./README.md "Summarize this file"');
@@ -3806,6 +3809,12 @@ async function main() {
           flags.exec = args[++i];
         } else if (a === "--write" || a === "-w") {
           flags.write = args[++i];
+        } else if (a === "--workspace") {
+          flags.workspace = args[++i];
+        } else if (a === "--workspace-depth") {
+          flags.workspaceDepth = parseInt(args[++i], 10) || Infinity;
+        } else if (a === "--workspace-max-file") {
+          flags.workspaceMaxFile = parseFloat(args[++i]) || null;
         } else {
           rest.push(a);
         }
@@ -3815,6 +3824,11 @@ async function main() {
         console.error('Please provide a message or use --read/--exec: copilot-cli chat [flags] "message"');
         process.exit(1);
       }
+      const wsFlags = {
+        workspace: flags.workspace || process.env.COPILOT_WORKSPACE || null,
+        depth: flags.workspaceDepth || Infinity,
+        maxFileMB: flags.workspaceMaxFile || null
+      };
       const systemParts = [];
       if (flags.read) {
         try {
