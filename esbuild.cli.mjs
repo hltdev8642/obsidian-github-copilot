@@ -13,16 +13,17 @@ const result = await esbuild.build({
   entryPoints: [path.resolve(process.cwd(), 'cli', 'bin', 'copilot-cli.js')],
   bundle: true,
   platform: 'node',
-  format: 'esm',
+  format: 'cjs',
   target: ['node18'],
   sourcemap: false,
+  banner: { js: banner },
   external: [...builtins],
-  outfile: path.join(outDir, 'copilot-cli.mjs'),
+  outfile: path.join(outDir, 'copilot-cli.js'),
   logLevel: 'info',
 });
 
 // Post-process: ensure the generated file has a single shebang at top
-const outFile = path.join(outDir, 'copilot-cli.mjs');
+const outFile = path.join(outDir, 'copilot-cli.js');
 try {
   let content = fs.readFileSync(outFile, 'utf8');
   // remove any duplicate shebangs and ensure single leading shebang

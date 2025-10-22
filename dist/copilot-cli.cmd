@@ -1,1 +1,1 @@
-@node "%~dp0copilot-cli.mjs" %*
+@node "%~dp0copilot-cli.js" %*

@@ -1512,5 +1512,4 @@ async function ensureFetchAvailable() {
   }
 }
 
-await ensureFetchAvailable();
 main();
